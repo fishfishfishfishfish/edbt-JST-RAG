@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# 本地环境变量(含 NEO4J_PASSWORD 等密钥,debug 时由 launch.json envFile 读取)
+.env
+neo4j/
+
+*.out
+*.whl

@@ -1,0 +1,81 @@
+# TCRag 配置:nuggetindex + SpacyLLMHybridConstructor(入库)
+#            + JSTRetriever(检索)
+#
+# 入库阶段(重新 ingest 时生效):
+#   - extractor.type=llm 作为混合构造器的 LLM 分支(PlaceholderValidity
+#     包装的 nuggetindex LLMExtractor / OllamaCompatClient 链路);
+#   - SpacyLLMHybridConstructor 对每篇文档用
+#     models/spacy_suitability_logreg_th6.joblib 做路由:
+#       pred=1 → 本地 spaCy 三元组抽取(零 LLM)
+#       pred=0 → LLM 抽取
+#   - 构造器由配套入口
+#     scripts/run_benchmark_jstrag.py
+#     强制注入(注册名 spacy_llm_hybrid),与数据集无关;
+#   - --reuse-db 时不构造 extractor、不触发构造器,仅检索评估。
+#
+# 检索阶段(双轴分区级联早停重排):
+#   BM25 召回 1000 → 全量 temporal_coeff → T×C 双轴分区 → 对角层级
+#   L1..L6 → 滑动窗口逐层语义重排+hybrid 打分 → 相邻层支配性门控早停
+#   → top_k。
+#
+# 可选环境变量:
+#   MRAG_RERANKER_MODEL / MRAG_RERANKER_TYPE / MRAG_BM25_INDEX_PATH
+#   MRAG_HYBRID_BASE(默认 0.0;设为 1.0 等价于语义仅重排基线)
+#   MRAG_SNT_WITH_TITLE(默认 true)
+#   MRAG_CASCADE_EARLY_STOP(默认 true;false 跑全量 baseline 做消融)
+#   MRAG_CASCADE_T_HIGH / MRAG_CASCADE_T_LOW(默认 0.9 / 0.6)
+#   MRAG_CASCADE_T_BINS(默认 1;[t_low,t_high) 均匀分区数,总桶数=t_bins+2)
+#   MRAG_CASCADE_C_BINS(默认 3;C 轴 BM25 名次分区桶数)
+#   MRAG_CASCADE_GATE_TOPK(默认 10)
+#   MRAG_CASCADE_PATIENCE(默认 2)
+#
+# 本配置与数据集无关:--dataset / --format / --db-path 均由配套 shell 显式传入。
+#
+# 运行(配套 shell,首次全量 ingest 构建 hybrid 库;加 --reuse-db 复用):
+#   bash scripts/run_benchmark_jstrag_timeqa.sh --no-qa --query-limit 5
+
+logging:
+  level: INFO
+  file: logs/tcrag.log
+  console: true
+
+llm:
+  provider: ollama
+  model: llama3.2
+  api_key: ""
+  base_url: ""
+  temperature: 0.0
+  max_tokens: 2048
+  timeout: 600
+  ollama_host: http://localhost:11434
+  ollama_model: llama3.2
+  structured_compat: true
+
+extractor:
+  # 仅重新 ingest 时生效:作为 hybrid 构造器的 LLM 分支;
+  # spaCy 分支由构造器工厂内部构建(en_core_web_sm)。
+  type: llm
+  llm_provider: ollama
+
+rag:
+  top_k: 20
+  ctx_top_k: 5
+  context_token_budget: 3000
+  fusion: rrf
+
+systems:
+  jstrag:
+    enabled: true
+    # 配套 shell 按数据集用 --db-path 覆盖为 hybrid 专用库。
+    db_path: data/jstrag.db
+    # 双轴分区级联早停检索器注入
+    retriever_factory: "tcrag.retrievers.jstretriever:create_jst_retriever"
+
+evaluation:
+  metrics:
+    retrieval_k: [5, 10, 20]
+    qa: true
+    system_perf: true
+  output_dir: reports
+  ragas:
+    enabled: false
