@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
-"""TCRag nuggetindex × SpacyLLMHybridConstructor benchmark 入口。
+"""Entry point for the TCRag nuggetindex × SpacyLLMHybridConstructor benchmark.
 
-单系统入口:固定装配注册名 ``"spacy_llm_hybrid"`` 的文档构造器(LR
-分类器路由 spaCy / LLM 两支 extractor),检索器 / db_path / extractor
-等仍由 YAML 配置与 CLI 决定。本入口自带完整 argparse 与运行逻辑,
-公共评测编排复用 ``_benchmark_common``。
+Single-system entry point: the document constructor registered under the name
+``"spacy_llm_hybrid"`` is hard-wired (the LR classifier routes documents to
+the two extractor branches, spaCy / LLM), while the retriever / db_path /
+extractor are still determined by the YAML configuration and the CLI. This
+entry point ships with its own complete argparse and run logic; the shared
+evaluation orchestration is reused from ``_benchmark_common``.
 
-示例:
-  python scripts/run_benchmark_jstrag.py \\
-      --dataset data/timeqa_annotated_dev.json \\
+Example:
+  python scripts/run_benchmark_jstrag.py \
+      --dataset data/timeqa_annotated_dev.json \
       --format timeqa --passage-limit 50 --query-limit 20
 """
 from __future__ import annotations
@@ -21,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# 注入项目根 + scripts 目录,使 _benchmark_common 与 tcrag 可裸导入(脚本无需安装包)
+# Inject the project root + scripts directory so _benchmark_common and tcrag can be imported directly (the script needs no installed package).
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = Path(__file__).resolve().parent
 for _p in (str(_ROOT), str(_SCRIPTS)):
@@ -42,14 +44,14 @@ from tcrag.rag_systems.jst_system import (
 DEFAULT_CONFIG = (
     "configs/jstrag_default.yaml"
 )
-#: 本入口固定装配的文档构造器注册名。
+#: Registration name of the document constructor hard-wired in this entry point.
 CONSTRUCTOR_NAME = "spacy_llm_hybrid"
-#: YAML 未设置 systems.jstrag.report_name 时的报告系统名。
+#: Report system name used when systems.jstrag.report_name is not set in YAML.
 DEFAULT_SYSTEM_NAME = "nuggetindex_duopart_spacy_llm_hybrid"
 
 
 def _file_size_bytes(path) -> int:
-    """返回文件字节数;文件不存在或不可读时返回 0。"""
+    """Return the file size in bytes; returns 0 when the file does not exist or is unreadable."""
     try:
         p = Path(path)
         return p.stat().st_size if p.is_file() else 0
@@ -58,7 +60,7 @@ def _file_size_bytes(path) -> int:
 
 
 def _sqlite_storage_bytes(db_path) -> int:
-    """统计 SQLite 落盘占用:主库 + WAL 模式的 ``-wal`` / ``-shm`` sidecar。"""
+    """Measure on-disk SQLite usage: the main database plus the ``-wal`` / ``-shm`` sidecars of WAL mode."""
     base = Path(db_path)
     total = _file_size_bytes(base)
     for suffix in ("-wal", "-shm"):
@@ -84,11 +86,11 @@ def _build_llm_extractor(cfg):
         provider=cfg.llm.provider,
         model=cfg.llm.model,
         api_key=cfg.llm.api_key or None,
-        # ollama 走默认 host;否则用 cfg.llm.base_url
+        # ollama uses the default host; otherwise use cfg.llm.base_url
         base_url=cfg.llm.base_url or None,
         temperature=cfg.llm.temperature,
-        # 长段落会产出多条 pretty-printed JSON 事实;本地带 thinking 的模型
-        # 思维链也占用生成预算,1024 容易截断 JSON 导致解析为空。
+        # Long passages produce multiple pretty-printed JSON facts; for local
+        # thinking-enabled models the chain-of-thought also consumes the generation budget, so 1024 easily truncates the JSON into an empty parse.
         max_tokens=4096,
         timeout_seconds=float(cfg.llm.timeout),
     )
@@ -101,7 +103,7 @@ def _build_llm_extractor(cfg):
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    """布尔型 MRAG 环境变量解析,口径与工厂函数(``_env_flag``)一致。"""
+    """Parse a boolean MRAG environment variable, following the same semantics as the factory function (``_env_flag``)."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -109,34 +111,36 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def _mrag_env_snapshot() -> dict[str, Any]:
-    """采集语义重排/级联早停相关 MRAG_* 环境变量的**实际生效值**。
+    """Collect the **effective values** of environment variables related to semantic
+    reranking / cascade early stopping.
 
-    未设置环境变量时回落到 ``create_mrag_*`` 工厂函数的同款默认值
-    (见 metriever_semantic_temporal*.py),类型转换口径也保持一致,
-    使报告自包含、可复现。``bm25_index_path`` 未设置时为 None
-    (工厂据此回退 store 后端 BM25)。
+    Unset variables fall back to the same defaults as the ``create_jst_retriever``
+    factory (see jstretriever.py), with identical type-conversion semantics so the
+    report is self-contained and reproducible. ``bm25_index_path`` is None when unset
+    (the factory then falls back to the store-backend BM25).
     """
     return {
-        "reranker_model": os.getenv("MRAG_RERANKER_MODEL", "nvidia/NV-Embed-v2"),
-        "reranker_type": os.getenv("MRAG_RERANKER_TYPE", "nv_embed"),
-        "bm25_index_path": os.getenv("MRAG_BM25_INDEX_PATH"),
-        "hybrid_base": float(os.getenv("MRAG_HYBRID_BASE", "0.0")),
-        "snt_with_title": _env_flag("MRAG_SNT_WITH_TITLE", True),
-        "cascade_early_stop": _env_flag("MRAG_CASCADE_EARLY_STOP", True),
-        "cascade_t_high": float(os.getenv("MRAG_CASCADE_T_HIGH", "0.9")),
-        "cascade_t_low": float(os.getenv("MRAG_CASCADE_T_LOW", "0.6")),
-        "cascade_t_bins": int(os.getenv("MRAG_CASCADE_T_BINS", "1")),
-        "cascade_c_bins": int(os.getenv("MRAG_CASCADE_C_BINS", "3")),
-        "cascade_gate_topk": int(os.getenv("MRAG_CASCADE_GATE_TOPK", "10")),
-        "cascade_patience": int(os.getenv("MRAG_CASCADE_PATIENCE", "2")),
+        "reranker_model": os.getenv("RERANKER_MODEL", "nvidia/NV-Embed-v2"),
+        "reranker_type": os.getenv("RERANKER_TYPE", "nv_embed"),
+        "bm25_index_path": os.getenv("BM25_INDEX_PATH"),
+        "hybrid_base": float(os.getenv("HYBRID_BASE", "0.0")),
+        "snt_with_title": _env_flag("SNT_WITH_TITLE", True),
+        "cascade_early_stop": _env_flag("CASCADE_EARLY_STOP", True),
+        "cascade_t_high": float(os.getenv("CASCADE_T_HIGH", "0.9")),
+        "cascade_t_low": float(os.getenv("CASCADE_T_LOW", "0.6")),
+        "cascade_t_bins": int(os.getenv("CASCADE_T_BINS", "1")),
+        "cascade_c_bins": int(os.getenv("CASCADE_C_BINS", "3")),
+        "cascade_gate_topk": int(os.getenv("CASCADE_GATE_TOPK", "10")),
+        "cascade_patience": int(os.getenv("CASCADE_PATIENCE", "2")),
     }
 
 
 def _build_run_meta(args: argparse.Namespace, cfg, skip_ingest: bool | None = None) -> dict:
-    """组装运行参数 + 关键配置快照,写入 md/json 报告便于复现。
+    """Assemble run parameters plus a snapshot of key configuration, written into the
+    md/json reports for reproducibility.
 
-    ``skip_ingest`` 为实际生效值(仅 --reuse-db 时 --skip-ingest 才生效);
-    缺省回退到原始 args 值。
+    ``skip_ingest`` is the effective value (--skip-ingest only takes effect together
+    with --reuse-db); when omitted it falls back to the raw args value.
     """
     run_meta: dict[str, Any] = {
         "cli_args": {
@@ -181,8 +185,8 @@ def _build_run_meta(args: argparse.Namespace, cfg, skip_ingest: bool | None = No
             "system_perf": cfg.evaluation.system_perf,
         },
     }
-    # MRAG_* 环境变量仅对 metriever* 自定义检索器生效;原生 nuggetindex
-    # 等运行不附加该节,避免报告出现与实际管道无关的参数。
+    # Cascade/reranking environment variables only take effect for custom retrievers; native
+    # nuggetindex and similar runs do not append this section, avoiding report parameters unrelated to the actual pipeline.
     if "metriever" in (cfg.jstrag.retriever_factory or ""):
         run_meta["mrag_retriever"] = _mrag_env_snapshot()
     return run_meta
@@ -233,8 +237,8 @@ async def _run(args: argparse.Namespace) -> int:
     llm_extractor = None if skip_ingest else _build_llm_extractor(cfg)
     retriever_factory = resolve_retriever_factory(cfg.jstrag.retriever_factory)
 
-    # LLM 提前创建:除 QA 答案生成外,还注入自定义 retriever(如 MRAG 的
-    # 关键词抽取与 QFS 摘要)。--no-qa 或 LLM 不可用时为 None,检索器自动跳过。
+    # The LLM is created up front: besides QA answer generation it is also injected into custom
+    # retrievers (e.g., MRAG keyword extraction and QFS summarization). It is None with --no-qa or when unavailable, and retrievers skip it automatically.
     llm = None
     if not args.no_qa:
         try:
@@ -244,20 +248,20 @@ async def _run(args: argparse.Namespace) -> int:
             llm = None
 
     if retriever_factory is not None:
-        # create_mrag_retriever(store, *, llm=None):通过 partial 注入 llm,
-        # 保持 retriever_factory(store) 的调用约定不变。
+        # create_mrag_retriever(store, *, llm=None): inject llm via partial while
+        # keeping the retriever_factory(store) calling convention unchanged.
         retriever_factory = functools.partial(retriever_factory, llm=llm)
 
-    # 直接装配 JSTRAGSystem 并强制 spacy_llm_hybrid 构造器。
+    # Assemble JSTRAGSystem directly and force the spacy_llm_hybrid constructor.
     system = JSTRAGSystem(
         constructor_factory=CONSTRUCTOR_NAME,
         db_path=cfg.jstrag.db_path,
-        extractor=llm_extractor,                   # effective skip_ingest 时为 None
+        extractor=llm_extractor,                   # None under effective skip_ingest
         fusion=cfg.rag.fusion,
         retriever_factory=retriever_factory,
         reuse_existing=args.reuse_db,
     )
-    # 报告系统名:YAML report_name 优先,否则用入口默认名。
+    # Report system name: the YAML report_name takes precedence; otherwise use the entry-point default name.
     system.name = cfg.jstrag.report_name or DEFAULT_SYSTEM_NAME
 
     evaluator = build_evaluator(cfg, llm)
@@ -265,12 +269,12 @@ async def _run(args: argparse.Namespace) -> int:
     report = await run_single_eval(system, docs, queries, evaluator, llm, cfg,
                                    skip_ingest=skip_ingest)
     if report is not None:
-        # run_single_eval 返回时系统已 aclose(SQLite 连接关闭、WAL 已
-        # checkpoint),此时统计落盘索引占用最稳定。
+        # When run_single_eval returns, the system has already been aclose'd (SQLite
+        # connections closed, WAL checkpointed); this is the most stable point to measure on-disk index usage.
         storage["index_path"] = str(cfg.jstrag.db_path)
         storage["index_bytes"] = _sqlite_storage_bytes(cfg.jstrag.db_path)
         report.storage = storage
-        # 运行参数与关键配置快照,写入 md 报告顶部便于复现。
+        # Run parameters and a key-configuration snapshot, written at the top of the md report for reproducibility.
         report.run_meta = _build_run_meta(args, cfg, skip_ingest)
     write_reports([report] if report else [], cfg, run_id=run_id)
     if args.per_query and report is not None:

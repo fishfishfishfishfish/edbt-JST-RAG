@@ -21,7 +21,7 @@ def create_extractor(cfg: AppConfig, *, external: BaseExtractor | None = None) -
     if kind == "rule_based":
         return RuleBasedExtractor()
     if kind in ("spacy", "spacy_sm"):
-        # 延迟 import:spacy 是可选重依赖,不影响其他 extractor 的加载。
+        # Deferred import: spacy is an optional heavy dependency and must not affect loading of the other extractors.
         from tcrag.extractors.spacy_extractor import SpacyFactExtractor
 
         return SpacyFactExtractor(

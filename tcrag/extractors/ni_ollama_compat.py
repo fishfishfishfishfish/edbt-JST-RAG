@@ -1,15 +1,15 @@
-"""Ollama 容错 structured-output client,对接 nuggetindex ``LLMClient`` 协议。
+"""Ollama fault-tolerant structured-output client, conforming to the nuggetindex ``LLMClient`` protocol.
 
-nuggetindex 原生 :class:`OllamaClient` 基于 instructor 严格校验,小模型
-(如 llama3.2:3b)常以两种方式违反 ``ExtractionPayload`` schema:
+nuggetindex's native :class:`OllamaClient` performs strict validation via instructor; small models
+(e.g. llama3.2:3b) commonly violate the ``ExtractionPayload`` schema in two ways:
 
-1. 输出单个 fact 对象而非 ``{"facts": [...]}`` 数组;
-2. 把 ``confidence`` 写成 ``null``(schema 要求 float,显式 null 不合法)。
+1. Emitting a single fact object instead of a ``{"facts": [...]}`` array;
+2. Writing ``confidence`` as ``null`` (the schema requires a float, and an explicit null is invalid).
 
-instructor 的修复循环把 ValidationError 回传重试,但小模型往往修不干净,
-重试耗尽后整篇文档 ingest failed。本 client 绕过 instructor,直接请求
-Ollama 的 OpenAI 兼容接口,在 pydantic 校验前规范化输出,兜住上述模式;
-仍失败时抛 ``ValueError``,由上层 ingest 的 try/except 降级为单文档跳过。
+instructor's repair loop feeds the ValidationError back for retries, but small models often cannot fix it cleanly,
+and after the retries are exhausted the whole document becomes ingest failed. This client bypasses instructor and directly requests
+Ollama's OpenAI-compatible endpoint, normalizing the output before pydantic validation to cover the patterns above;
+when it still fails, it raises ``ValueError``, which the upper ingest layer's try/except degrades into skipping that single document.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ _DEFAULT_OLLAMA_URL = "http://localhost:11434/v1"
 
 
 class OllamaCompatClient:
-    """Duck-type nuggetindex ``LLMClient``(仅需 ``achat_structured``)。"""
+    """Duck-types the nuggetindex ``LLMClient`` (only ``achat_structured`` is required)."""
 
     def __init__(self, cfg: Any, *, max_retries: int = 1) -> None:
         from openai import AsyncOpenAI
@@ -46,11 +46,11 @@ class OllamaCompatClient:
     ) -> BaseModel:
         last_exc: Exception | None = None
         for _ in range(self._max_retries + 1):
-            # Ollama structured output:constrained decoding 在 token 层
-            # 强制 schema 合法(JSON 对象/数组、confidence 不为 null),
-            # 小模型(llama3.2)也能稳定产出;_normalize 仅作兜底。
-            # schema 副本上加 maxItems:小模型可能无限生成事实直到
-            # max_tokens 截断产出非法 JSON;与框架 max_facts 语义一致。
+            # Ollama structured output: constrained decoding enforces schema validity at the token level
+            # (JSON object/array, confidence not null), so even small models (llama3.2) produce stable output;
+            # _normalize serves only as a fallback safety net.
+            # Add maxItems on the schema copy: a small model may keep generating facts without bound until
+            # max_tokens truncation produces invalid JSON; this matches the semantics of the framework's max_facts.
             schema = response_model.model_json_schema()
             facts_prop = schema.get("properties", {}).get("facts")
             if isinstance(facts_prop, dict):
@@ -85,11 +85,11 @@ class OllamaCompatClient:
 
     @staticmethod
     def _decode_json(content: str) -> Any:
-        """容忍 markdown fence 与前后缀说明文本,解码首个 JSON 值。
+        """Tolerate markdown fences and surrounding explanatory text; decode the first JSON value.
 
-        llama3.2 常输出 ``Here are ...:\\n```json [...]``(顶层数组)或带
-        说明文字的对象,故从首个 ``{``/``[`` 用 ``raw_decode`` 取首个完整
-        JSON 值;顶层对象/数组/裸对象拼接均能覆盖。
+        llama3.2 often emits ``Here are ...:\\n```json [...]`` (a top-level array) or an object with
+        explanatory text, so from the first ``{``/``[`` it uses ``raw_decode`` to extract the first complete
+        JSON value; top-level objects, arrays, and concatenated bare objects are all covered.
         """
         starts = [i for i in (content.find("{"), content.find("[")) if i >= 0]
         if starts:
@@ -107,7 +107,7 @@ class OllamaCompatClient:
 
     @staticmethod
     def _normalize(data: Any) -> Any:
-        """修复小模型对 ``ExtractionPayload`` 的典型违规。"""
+        """Repair the typical violations of ``ExtractionPayload`` made by small models."""
         if isinstance(data, list):
             data = {"facts": data}
         if not isinstance(data, dict):
@@ -120,14 +120,14 @@ class OllamaCompatClient:
             for f in facts:
                 if not isinstance(f, dict):
                     continue
-                # 剔除空 subject/predicate/object(FactTriple 要求非空字符串)
+                # Drop entries with empty subject/predicate/object (FactTriple requires non-empty strings)
                 if not all(
                     isinstance(f.get(k), str) and f.get(k, "").strip()
                     for k in ("subject", "predicate", "object")
                 ):
                     continue
                 if f.get("confidence") is None:
-                    # 剔除 null 让 pydantic default(0.8) 生效
+                    # Remove the null so that the pydantic default (0.8) takes effect
                     f = {k: v for k, v in f.items() if k != "confidence"}
                 cleaned.append(f)
             data["facts"] = cleaned

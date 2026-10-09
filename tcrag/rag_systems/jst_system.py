@@ -1,30 +1,33 @@
-"""``JSTRAGSystem``(独立实现):``DocumentConstructor`` 可替换的 RAG 系统。
+"""``JSTRAGSystem`` (standalone implementation): a RAG system with a replaceable ``DocumentConstructor``.
 
-直接继承 :class:`tcrag.rag_systems.base.BaseRAGSystem`,
-建库备份 / 增量复用 / FTS5 sanitize /
-按文档聚合检索 / 自定义 retriever 等逻辑均在本模块内实现。
+It directly subclasses :class:`tcrag.rag_systems.base.BaseRAGSystem`;
+index backup / incremental reuse / FTS5 sanitization /
+per-document aggregated retrieval / custom retriever support are all
+implemented within this module.
 
-系统唯一的开放点是入库管线的构造器可替换——在首次 ``aingest`` 前,
-把所选实现安装到 ``NuggetStore._constructor``(nuggetindex 只在该属性
-为 None 时才懒建原生实现,因此预设值优先生效),无需修改 nuggetindex
-仓库。可选实现统一放在 :mod:`tcrag.constructors`。
+The system's only extension point is the replaceable constructor of the
+ingestion pipeline: before the first ``aingest`` call, install the chosen
+implementation into ``NuggetStore._constructor`` (nuggetindex lazily builds
+its native implementation only when this attribute is None, so a preset value
+takes precedence), without modifying the nuggetindex repository. The available
+implementations live in :mod:`tcrag.constructors`.
 
-示例::
+Example::
 
-    # 1) 按注册名选用构造器(默认即 spacy_llm_hybrid)
+    # 1) Select a constructor by registered name (the default is spacy_llm_hybrid)
     system = JSTRAGSystem(
         db_path="data/nuggetindex.db",
         extractor=extractor,
     )
 
-    # 2) 传入自定义工厂(签名 factory(store, **kwargs))
+    # 2) Pass a custom factory (signature factory(store, **kwargs))
     system = JSTRAGSystem(
         db_path="data/nuggetindex.db",
         extractor=extractor,
         constructor_factory=lambda store: MyConstructor(extractor=...),
     )
 
-    # 3) constructor_factory=None:完全不注入,退回 NuggetStore 自身懒建
+    # 3) constructor_factory=None: skip injection entirely and fall back to NuggetStore's own lazy construction
 """
 
 from __future__ import annotations
@@ -51,21 +54,24 @@ ConstructorSpec = str | Callable[..., Any] | None
 
 
 class JSTRAGSystem(BaseRAGSystem):
-    """``JSTRAGSystem``:开放 ``DocumentConstructor`` 为可替换实现。
+    """``JSTRAGSystem``: exposes ``DocumentConstructor`` as a replaceable implementation.
 
     Args:
-        db_path: SQLite 索引路径。
-        extractor: nuggetindex duck-type extractor(产 ExtractionResult)。
-        fusion: 原生 retriever 的融合方式(如 ``"rrf"``)。
-        retriever_factory: 自定义检索器工厂 ``factory(store)``;为 None
-            时使用 nuggetindex 原生 Retriever。
-        reuse_existing: 直接打开已有索引(不备份/不重建),并以 passages
-            表为准跳过已入库文档。
-        constructor_factory: 构造器规格。默认 ``"spacy_llm_hybrid"``——
-            LR 分类器路由 spaCy / LLM 两支 extractor;传其他注册名或
-            ``factory(store)`` 即可替换整条入库管线;传 ``None`` 则不
-            注入,沿用 NuggetStore 的隐式懒建。
-        constructor_kwargs: 透传给构造器工厂的额外关键字参数。
+        db_path: Path to the SQLite index.
+        extractor: A nuggetindex duck-typed extractor (producing ExtractionResult).
+        fusion: Fusion strategy for the native retriever (e.g. ``"rrf"``).
+        retriever_factory: Custom retriever factory ``factory(store)``; when
+            None, the nuggetindex native Retriever is used.
+        reuse_existing: Open an existing index directly (no backup/rebuild) and
+            skip already-ingested documents based on the passages table.
+        constructor_factory: Constructor specification. Defaults to
+            ``"spacy_llm_hybrid"`` — an LR classifier routes between the spaCy
+            and LLM extractor branches; pass another registered name or a
+            ``factory(store)`` to replace the entire ingestion pipeline; pass
+            ``None`` to skip injection and keep NuggetStore's implicit lazy
+            construction.
+        constructor_kwargs: Additional keyword arguments forwarded to the
+            constructor factory.
     """
 
     name = "jstrag"
@@ -87,7 +93,7 @@ class JSTRAGSystem(BaseRAGSystem):
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._reuse_existing = reuse_existing
         if reuse_existing:
-            # 复用已有索引:不备份/不重建,直接打开;此时无需 extractor。
+            # Reuse an existing index: open it directly without backup/rebuild; no extractor is needed in this case.
             if not self._db_path.exists():
                 raise FileNotFoundError(
                     f"reuse_existing=True but db not found: {self._db_path}"
@@ -97,8 +103,8 @@ class JSTRAGSystem(BaseRAGSystem):
                 self._db_path,
             )
         elif self._db_path.exists():
-            # 不直接删除已有索引文件,而是重命名为 .bak.{timestamp} 备份,
-            # 便于回溯或对比上一次运行的落盘数据。
+            # Do not delete the existing index file directly; rename it to a .bak.{timestamp} backup
+            # so that the persisted data from the previous run can be inspected or compared.
             ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             backup = self._db_path.with_suffix(
                 f".bak.{ts}" + self._db_path.suffix
@@ -138,12 +144,12 @@ class JSTRAGSystem(BaseRAGSystem):
         self._constructor_installed = False
 
     def _open_readonly_conn(self) -> sqlite3.Connection:
-        """以只读方式打开 SQLite(WAL 下与 store 的写连接互不干扰)。"""
+        """Open SQLite in read-only mode (under WAL this does not interfere with the store's write connection)."""
         uri = f"file:{self._db_path}?mode=ro"
         return sqlite3.connect(uri, uri=True)
 
     def _load_passage_texts(self) -> dict[str, str]:
-        """从 passages 表读取 {source_id: 原文};表缺失时回退空缓存。"""
+        """Load a {source_id: raw text} mapping from the passages table; fall back to an empty cache if the table is missing."""
         try:
             con = self._open_readonly_conn()
             try:
@@ -160,7 +166,7 @@ class JSTRAGSystem(BaseRAGSystem):
         return {sid: text for sid, text in rows}
 
     def _count_table(self, table: str) -> int:
-        """只读统计表行数;表缺失或查询失败返回 0。"""
+        """Count rows in a table using a read-only connection; return 0 if the table is missing or the query fails."""
         try:
             con = self._open_readonly_conn()
             try:
@@ -173,7 +179,7 @@ class JSTRAGSystem(BaseRAGSystem):
             return 0
 
     def _load_existing_source_ids(self) -> set[str]:
-        """读取 passages 表中已入库的 source_id 集合;失败返回空集。"""
+        """Read the set of already-ingested source_ids from the passages table; return an empty set on failure."""
         try:
             con = self._open_readonly_conn()
             try:
@@ -233,7 +239,7 @@ class JSTRAGSystem(BaseRAGSystem):
         start = time.perf_counter()
         total = 0
         skipped = 0
-        # reuse_existing 增量入库:以 passages 表已有 source_id 为准跳过,
+        # Incremental ingest with reuse_existing: skip documents whose source_id already exists in the passages table,
         # To avoid re-running the (idempotent but computationally expensive) LLM extractor on already-indexed documents.
         existing_ids: set[str] = (
             self._load_existing_source_ids() if self._reuse_existing else set()
@@ -249,7 +255,7 @@ class JSTRAGSystem(BaseRAGSystem):
         for i, doc in enumerate(documents, 1):
             if doc.source_id in existing_ids:
                 skipped += 1
-                # 复用模式下缓存已从 passages 重建;setdefault 兜底重建失败的情况。
+                # In reuse mode the cache is rebuilt from the passages table; setdefault covers the case where rebuilding fails.
                 self._doc_text_cache.setdefault(doc.source_id, doc.text)
                 continue
             self._doc_text_cache[doc.source_id] = doc.text
@@ -265,7 +271,7 @@ class JSTRAGSystem(BaseRAGSystem):
                     "ingest failed for %s: %s", doc.source_id, exc
                 )
             else:
-                # 成功(或幂等合并)后写回集合,同批次内重复 source_id 不重复抽取。
+                # Add back to the set after success (or idempotent merge) so duplicate source_ids within the same batch are not re-extracted.
                 existing_ids.add(doc.source_id)
             if i % log_interval_docs == 0:
                 now = time.perf_counter()
@@ -288,14 +294,14 @@ class JSTRAGSystem(BaseRAGSystem):
         self, query, *, top_k=10, reference_time=None, **kwargs
     ):
         if self._custom_retriever:
-            # 自定义 retriever(metriever)拿到原始 query:OR join 会把 "as of"
-            # 拆成 "as OR of",破坏时间触发词检测;FTS5 sanitize 由检索器
-            # 在调用 abm25_search 前自行完成。
+            # The custom retriever (metriever) receives the raw query: an OR join would split
+            # "as of" into "as OR of", breaking temporal trigger-word detection; FTS5 sanitization is
+            # performed by the retriever itself before calling abm25_search.
             safe_query = query
             if not (safe_query or "").strip():
                 return []
         else:
-            # 原生 retriever 直接查 FTS5:去特殊符号 + OR join 保召回。
+            # The native retriever queries FTS5 directly: strip special characters and OR-join the terms to preserve recall.
             safe_query = sanitize_fts_query(query)
             if not safe_query:
                 return []

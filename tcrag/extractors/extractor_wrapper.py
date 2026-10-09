@@ -1,12 +1,12 @@
-"""framework → nuggetindex 的 extractor 包装器。
+"""framework → nuggetindex extractor wrapper.
 
-把 framework 侧 :class:`tcrag.extractors.base.BaseExtractor`
-(产 :class:`tcrag.data.models.AtomicFact` 列表)包装成 nuggetindex
-duck-type extractor:``aextract`` 返回
-``nuggetindex.extractors.base.ExtractionResult`` 列表,可直接作为
-``NuggetStore(extractor=...)`` / DocumentConstructor 的 extractor 注入。
+It wraps a framework-side :class:`tcrag.extractors.base.BaseExtractor`
+(which produces :class:`tcrag.data.models.AtomicFact` lists) into a nuggetindex
+duck-type extractor: ``aextract`` returns a
+``nuggetindex.extractors.base.ExtractionResult`` list, which can be injected directly as
+the extractor of ``NuggetStore(extractor=...)`` / DocumentConstructor.
 
-用法::
+Usage::
 
     from tcrag.extractors.extractor_wrapper import ExtractorWrapper
     from tcrag.extractors.spacy_extractor import SpacyFactExtractor

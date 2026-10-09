@@ -59,8 +59,8 @@ class _BaseLLMClientAdapter:
             user_prompt,
             system_prompt=system_prompt,
             temperature=self._temperature,
-            # 长段落会产出多条 pretty-printed JSON 事实;本地带 thinking 的模型
-            # (如 qwen3)思维链也占用生成预算,1024 容易截断 JSON 导致解析为空。
+            # Long passages produce multiple pretty-printed JSON facts; for local models with thinking
+            # (e.g. qwen3), the chain of thought also consumes the generation budget, and 1024 can easily truncate the JSON and yield an empty parse.
             max_tokens=self._max_tokens,
         )
         print(f"resp.content: {resp.content}")

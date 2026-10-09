@@ -29,7 +29,7 @@ def _serialisable(obj: Any) -> Any:
 
 
 def _human_bytes(num_bytes: float) -> str:
-    """把字节数格式化为人类可读字符串(如 ``1.23 MB``)。"""
+    """Format a byte count as a human-readable string (e.g. ``1.23 MB``)."""
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if size < 1024 or unit == "TB":
@@ -64,8 +64,8 @@ def write_markdown_report(reports: list[SystemReport], path: str | Path) -> Path
     if not reports:
         lines.append("_No systems evaluated._")
     else:
-        # Run Configuration:运行参数与关键配置快照(取首个 report,
-        # 单系统入口一次只产生一个 report;多系统对比共享同一组 args/cfg)。
+        # Run Configuration: a snapshot of run arguments and key configuration (taken from the first report;
+        # the single-system entry point produces only one report per run, while multi-system comparisons share the same set of args/cfg).
         run_meta = reports[0].run_meta
         if run_meta:
             lines.append("## Run Configuration")
@@ -140,8 +140,9 @@ def write_markdown_report(reports: list[SystemReport], path: str | Path) -> Path
                         f"queries `{r.storage.get('queries_file', '')}` = "
                         f"{_human_bytes(r.storage['queries_bytes'])}"
                     )
-                # index:SQLite 等本地索引只填 index_bytes;Neo4j 等服务端
-                # 索引量不到文件,填 index_nodes/index_edges(字节数尽力获取)。
+                # index: local indexes such as SQLite populate only index_bytes; server-side
+                # indexes such as Neo4j cannot be measured as files, so index_nodes/index_edges are
+                # populated instead (byte counts obtained on a best-effort basis).
                 if r.storage.get("index_bytes") is not None or r.storage.get("index_nodes") is not None:
                     index_desc: list[str] = []
                     if r.storage.get("index_bytes") is not None:

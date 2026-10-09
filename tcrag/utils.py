@@ -1,4 +1,4 @@
-"""跨模块共享的文本工具函数。"""
+"""Text utility functions shared across modules."""
 
 from __future__ import annotations
 

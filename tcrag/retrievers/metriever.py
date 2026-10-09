@@ -1,23 +1,24 @@
-"""MRAG 时间感知检索器:独立、可复用的 Retriever 组件。
+"""MRAG time-aware retriever: a standalone, reusable Retriever component.
 
-重构自原始 MRAG metriever.py,保留 MRAG 的核心检索管道:
+Refactored from the original MRAG metriever.py, preserving the core MRAG retrieval pipeline:
 
-1. **初始检索**:BM25(通过 nuggetindex store 后端或 Pyserini LuceneSearcher)
-2. **关键词排序**:对候选 passage 计算关键词加权命中分数,保留 top-ctx_topk
-3. **语义排序**:使用 CrossEncoder / BGE / NV-Embed 等模型重排
-4. **QFS 摘要**:LLM 为 top-k passage 生成问题聚焦摘要(保留关键日期)
-5. **句子关键词排序**:句子级关键词命中 + 摘要参与排序
-6. **时间-语义混合排序**:
+1. **Initial retrieval**: BM25 (via the nuggetindex store backend or Pyserini LuceneSearcher)
+2. **Keyword ranking**: compute keyword-weighted hit scores for candidate passages, keeping the top ctx_topk
+3. **Semantic ranking**: rerank with models such as CrossEncoder / BGE / NV-Embed
+4. **QFS summarization**: the LLM generates question-focused summaries for the top-k passages (keeping key dates)
+5. **Sentence-level keyword ranking**: sentence-level keyword hits plus summaries participating in ranking
+6. **Temporal-semantic hybrid ranking**:
    ``final_score = hybrid_base * semantic + (1-hybrid_base) * semantic * temporal_coeff``
-   默认 ``hybrid_base=0``,等价于 ``final_score = semantic * temporal_coeff``
+   By default ``hybrid_base=0``, which is equivalent to ``final_score = semantic * temporal_coeff``
 
-时间感知核心:
-- ``year_identifier(text)``:正则提取年份,先展开 "1990-93"/"1990-1995" 范围
-- ``remove_implicit_condition(q)``:检测 latest/last/first/earliest 等隐式条件
-- ``get_spline_function(...)``:线性插值,窗口 [0.6, 1.0],span=50 年
-- ``get_temporal_coeffs(...)``:按时间关系类型(between/before/after)筛选合规年份
+Time-awareness core:
+- ``year_identifier(text)``: extract years with regex, first expanding "1990-93"/"1990-1995" ranges
+- ``remove_implicit_condition(q)``: detect implicit conditions such as latest/last/first/earliest
+- ``get_spline_function(...)``: linear interpolation, window [0.6, 1.0], span of 50 years
+- ``get_temporal_coeffs(...)``: filter eligible years by temporal relation type (between/before/after)
 
-兼容 ``scripts/run_benchmark_jstrag.py`` 的 ``retriever_factory`` 配置:
+Compatible with the ``retriever_factory`` configuration of
+``scripts/run_benchmark_jstrag.py``:
 
 .. code-block:: yaml
 
@@ -25,12 +26,14 @@
       jstrag:
         retriever_factory: "tcrag.retrievers.metriever:create_mrag_retriever"
 
-工厂函数 ``create_mrag_retriever(store, *, llm=None)`` 返回的 MRAGRetriever 实现了
-``async aretrieve(query, *, query_time, view, top_k, fusion, filters) -> list[RetrievalResult]``。
+The MRAGRetriever returned by the factory function
+``create_mrag_retriever(store, *, llm=None)`` implements
+``async aretrieve(query, *, query_time, view, top_k, fusion, filters) -> list[RetrievalResult]``.
 
-通过环境变量 ``MRAG_RERANKER_TYPE``, ``MRAG_RERANKER_MODEL`` 选择 rerank模型。
-MRAG_RERANKER_TYPE="cross_encoder"
-MRAG_RERANKER_MODEL="/home/xinyuchen/TCRag/models/ms-marco-MiniLM-L6-v2"
+The rerank model is selected through the environment variables ``RERANKER_TYPE``
+and ``RERANKER_MODEL``.
+RERANKER_TYPE="cross_encoder"
+RERANKER_MODEL="/home/xinyuchen/TCRag/models/ms-marco-MiniLM-L6-v2"
 """
 from __future__ import annotations
 
@@ -46,15 +49,15 @@ from tcrag.utils import sanitize_fts_query
 
 logger = get_logger("retrievers.metriever")
 
-#: source_id 末尾的段落序号(TimeQA:``.../wiki/Besart_Berisha_18``)。
+#: Paragraph index at the end of source_id (TimeQA: ``.../wiki/Besart_Berisha_18``).
 _PARA_IDX_SUFFIX = re.compile(r"_\d+$")
 
 
 def _title_from_source_id(source_id: str) -> str:
-    """TimeQA 口径 ``source_id`` → 文档标题人类形式。
+    """TimeQA-style ``source_id`` → human-readable document title.
 
-    ``timeqa_/wiki/Besart_Berisha_18`` → ``Besart Berisha``。
-    无可取段时返回 ``""``(调用方保持空标题)。
+    ``timeqa_/wiki/Besart_Berisha_18`` → ``Besart Berisha``.
+    Returns ``""`` when no paragraph can be extracted (the caller keeps the empty title).
     """
     tail = source_id.rsplit("/", 1)[-1]
     if not tail:
@@ -63,40 +66,48 @@ def _title_from_source_id(source_id: str) -> str:
     return tail.replace("_", " ").strip()
 
 
-# ── 可选依赖(缺失时降级)──────────────────────────────────────────────────
+# ── Optional dependencies (with graceful degradation when missing) ────────
 
-# NLTK 依赖分两层(常见坑:pip 装了 nltk 但语料数据缺失,运行时抛 LookupError):
-#   1) pip 包:
+# NLTK dependencies come in two layers (a common pitfall: the nltk pip package is
+# installed but the corpus data is missing, raising LookupError at runtime):
+#   1) pip package:
 #        pip install nltk
-#   2) 语料数据 —— nltk>=3.9 需要 punkt_tab / averaged_perceptron_tagger_eng;
-#      在线下载(`python -m nltk.downloader ...`)走 raw.githubusercontent.com,
-#      弱网常卡超时或报 SSL EOF。推荐手工下载 zip 后解压到指定目录:
+#   2) Corpus data -- nltk>=3.9 requires punkt_tab / averaged_perceptron_tagger_eng;
+#      online downloads (`python -m nltk.downloader ...`) go through raw.githubusercontent.com,
+#      which on weak networks often hangs on timeout or fails with SSL EOF. It is
+#      recommended to manually download the zip and extract it to the target directory:
 #
-#      数据包下载地址
+#      Data package download URL
 #      git clone https://github.com/nltk/nltk_data.git
-#      将 nltk_data/packages改为nltk_data, 放在~/nltk_data
+#      Rename nltk_data/packages to nltk_data and place it at ~/nltk_data
 
-#      若 nltk_data 目录 group 可写会触发 "non-private download directory" warning:
+#      If the nltk_data directory is group-writable it triggers a
+#      "non-private download directory" warning:
 #        chmod 755 ~/nltk_data
-#      数据也可放在 conda 环境内(免污染 home):~/miniconda3/envs/<env>/nltk_data/;
-#      或设置环境变量 NLTK_DATA=/your/dir 自定义搜索路径。
-#       通过python -c "import nltk; print(nltk.data.path)" 查看 nltk_data 目录路径
+#      The data can also be placed inside the conda environment (to avoid polluting
+#      home): ~/miniconda3/envs/<env>/nltk_data/;
+#      or set the environment variable NLTK_DATA=/your/dir to customize the search path.
+#       Check the nltk_data directory path via
+#       python -c "import nltk; print(nltk.data.path)"
 #
-#      验证:
+#      Verification:
 #        python -c "from nltk.tokenize import sent_tokenize; \
 #           print(sent_tokenize('A test. Another one.'))"
-#   说明:旧版 punkt / averaged_perceptron_tagger 在 nltk>=3.9 已不被使用,无需下载。
-# 任一缺失时降级为 regex 分句/分词、全 NN 词性、空词形还原:
-#   MRAG 管道仍可运行,但关键词词形变体扩展关闭,可能降低召回。
+#   Note: the legacy punkt / averaged_perceptron_tagger are no longer used in
+#   nltk>=3.9 and need not be downloaded.
+# If either is missing, fall back to regex sentence splitting/tokenization,
+# all-NN POS tags, and an empty lemmatizer:
+#   the MRAG pipeline still runs, but morphological variant expansion of keywords
+#   is disabled, which may reduce recall.
 _nltk_data_available = False
 try:
     from nltk.tokenize import sent_tokenize as _nltk_sent_tokenize
     from nltk.tokenize import word_tokenize as _nltk_word_tokenize
     from nltk.tag import pos_tag as _nltk_pos_tag
     from nltk.stem import WordNetLemmatizer as _NLTKWordNetLemmatizer
-    _nltk_sent_tokenize("Test sentence.")  # 触发数据加载检查
+    _nltk_sent_tokenize("Test sentence.")  # Trigger the data availability check
     _nltk_data_available = True
-except Exception as _nltk_exc:  # ImportError(nltk 包缺失)或 LookupError(语料缺失)
+except Exception as _nltk_exc:  # ImportError (nltk package missing) or LookupError (corpus data missing)
     logger.debug("NLTK 语料不可用,降级为 regex 分词: %s", _nltk_exc)
 
 if _nltk_data_available:
@@ -106,24 +117,24 @@ if _nltk_data_available:
     WordNetLemmatizer = _NLTKWordNetLemmatizer
 else:
     def sent_tokenize(text: str) -> list[str]:
-        """Regex 分句(NLTK 数据缺失时的降级实现)。"""
+        """Regex sentence splitter (fallback implementation when NLTK data is missing)."""
         sents = re.split(r"(?<=[.!?])\s+", text.strip())
         return [s for s in sents if s]
 
     def word_tokenize(text: str) -> list[str]:
-        """Regex 分词(NLTK 数据缺失时的降级实现)。"""
+        """Regex tokenizer (fallback implementation when NLTK data is missing)."""
         return re.findall(r"\b[\w'-]+\b", text)
 
     def pos_tag(tokens: list[str]) -> list[tuple[str, str]]:
-        """降级 POS tagger:全部标记为 NN。"""
+        """Fallback POS tagger: tag every token as NN."""
         return [(t, "NN") for t in tokens]
 
     class WordNetLemmatizer:  # type: ignore[no-redef]
-        """降级 lemmatizer:返回原词不做词形还原。"""
+        """Fallback lemmatizer: return the original word without lemmatization."""
         def lemmatize(self, word: str, pos: str = "n") -> str:
             return word
 
-# pattern.en 用于词形变体扩展;缺失时降级为空实现
+# pattern.en is used for morphological variant expansion; falls back to a no-op when missing
 try:
     from pattern.en import lexeme as _pattern_lexeme
     _pattern_available = True
@@ -131,7 +142,7 @@ except Exception:
     _pattern_available = False
     _pattern_lexeme = None
 
-# torch / transformers(语义模型用,可选)
+# torch / transformers (used by semantic models, optional)
 try:
     import torch
     import torch.nn.functional as F
@@ -140,7 +151,7 @@ try:
 except ImportError:
     _torch_available = False
 
-# regex 库(Unicode-aware tokenizer 用,可选)
+# regex library (used by the Unicode-aware tokenizer, optional)
 try:
     import regex as _re_mod
     import unicodedata as _ud
@@ -151,16 +162,16 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 常量与配置
+# Constants and configuration
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 关键词低信息词排除列表
+# Keyword exclusion list of low-information words
 EXCL = [
     "time", "years", "for", "new", "recent", "current",
     "whom", "who", "out", "place", "not",
 ]
 
-# 关键词命中权重
+# Keyword hit weights
 KEYWORD_WEIGHTS = {
     "special": 1.0,
     "superlative": 0.7,
@@ -169,7 +180,7 @@ KEYWORD_WEIGHTS = {
     "adjective": 0.4,
 }
 
-# 数字映射
+# Number mappings
 NUMBER_MAP = {
     "1": "one", "2": "two", "3": "three", "4": "four", "5": "five",
     "6": "six", "7": "seven", "8": "eight", "9": "nine", "10": "ten",
@@ -182,7 +193,7 @@ NUMBER_MAP = {
 }
 NUMBER_MAP_B = {v: k for k, v in NUMBER_MAP.items()}
 
-# 月份映射
+# Month mappings
 MONTH_TO_NUMBER = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
     "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
@@ -193,32 +204,33 @@ SHORT_MONTH_TO_NUMBER = {
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
-# 时间系数曲线参数
+# Temporal coefficient curve parameters
 TEMPORAL_LOW = 0.6
 TEMPORAL_SPAN = 50
 TEMPORAL_FALLBACK = 0.5
 
-# parse_temporal_question 自动检测时扫描的时间关系触发词。
-# 分类与原始 MRAG 一致:before 类 / after 类;多词触发词优先匹配。
+# Temporal-relation triggers scanned when parse_temporal_question performs auto-detection.
+# The classification matches the original MRAG: before-type / after-type; multi-word triggers take priority.
 _TIME_RELATION_TRIGGERS: tuple[str, ...] = (
     "as of", "before", "after", "since", "until", "from", "by",
 )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DPR-style SimpleTokenizer & has_answer(移植自 contriever/src/evaluation.py)
+# DPR-style SimpleTokenizer & has_answer (ported from contriever/src/evaluation.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SimpleTokenizer:
-    """DPR-style Unicode-aware tokenizer。
+    """DPR-style Unicode-aware tokenizer.
 
-    使用 ``regex`` 库的 Unicode 属性转义(``\\p{L}`` 等)做 token 切分;
-    ``regex`` 不可用时回退到标准 ``re`` 的 ``\\w`` / ``\\S`` 模式。
+    Splits tokens using Unicode property escapes (``\\p{L}`` etc.) from the
+    ``regex`` library; falls back to the ``\\w`` / ``\\S`` patterns of the
+    standard ``re`` library when ``regex`` is unavailable.
     """
 
     ALPHA_NUM = r"[\p{L}\p{N}\p{M}]+"
     NON_WS = r"[^\p{Z}\p{C}]"
-    # re 库回退模式(不支持 \p Unicode 属性)
+    # Fallback patterns for the re library (\p Unicode properties are not supported)
     _ALPHA_NUM_FALLBACK = r"[\w]+"
     _NON_WS_FALLBACK = r"\S"
 
@@ -241,14 +253,14 @@ class SimpleTokenizer:
 
 
 def _normalize(text: str) -> str:
-    """NFD normalization。"""
+    """NFD normalization."""
     if _regex_available:
         return _ud.normalize("NFD", text)
     return text
 
 
 def has_answer(answers, text, tokenizer: SimpleTokenizer) -> bool:
-    """检查文档是否包含答案字符串。"""
+    """Check whether the document contains the answer string."""
     text = _normalize(text)
     text = tokenizer.tokenize(text, uncased=True)
     for answer in answers:
@@ -261,11 +273,11 @@ def has_answer(answers, text, tokenizer: SimpleTokenizer) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 时间解析工具(移植自 utils.py)
+# Temporal parsing utilities (ported from utils.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def find_month(w: str) -> int | None:
-    """从字符串中提取月份数字。"""
+    """Extract the month number from a string."""
     w = w.lower()
     for m, num in MONTH_TO_NUMBER.items():
         if m in w:
@@ -277,7 +289,7 @@ def find_month(w: str) -> int | None:
 
 
 def replace_dates(text: str) -> str:
-    """展开 "1990-93" 格式的年份范围。"""
+    """Expand year ranges in the "1990-93" format."""
     pattern = r"(\b\d{4})[–-](\d{2}\b)"
 
     def replace_func(match):
@@ -289,7 +301,7 @@ def replace_dates(text: str) -> str:
 
 
 def expand_year_range(text: str) -> str:
-    """展开 "1990-1995" 格式的年份范围。"""
+    """Expand year ranges in the "1990-1995" format."""
     def replace_range(match):
         start_year = int(match.group(1))
         end_year = int(match.group(2))
@@ -300,10 +312,12 @@ def expand_year_range(text: str) -> str:
 
 
 def year_identifier(timestamp: str) -> list[int]:
-    """从文本中提取所有四位年份。
+    """Extract all four-digit years from the text.
 
-    先展开年份范围(如 "1990-93" → "1990 1991 ... 1993"),再用正则匹配。
-    返回去重排序后的整数列表;无匹配时返回空列表。
+    Year ranges are expanded first (e.g. "1990-93" → "1990 1991 ... 1993") and
+    then matched with regex.
+    Returns a deduplicated, sorted list of integers; returns an empty list when
+    nothing matches.
     """
     timestamp = replace_dates(timestamp)
     timestamp = expand_year_range(timestamp)
@@ -315,11 +329,11 @@ def year_identifier(timestamp: str) -> list[int]:
 
 
 def remove_implicit_condition(no_time_question: str) -> tuple[str, str | None]:
-    """检测并移除隐式时间条件词。
+    """Detect and remove implicit temporal condition words.
 
     Returns:
         (normalized_question, implicit_condition):
-        implicit_condition 为 'first' 或 'last' 或 None。
+        implicit_condition is 'first', 'last', or None.
     """
     mapping = {
         " latest": "last",
@@ -342,7 +356,7 @@ def remove_implicit_condition(no_time_question: str) -> tuple[str, str | None]:
 
 
 def get_wordnet_pos(treebank_tag: str) -> str:
-    """将 treebank POS tag 映射到 WordNet POS。"""
+    """Map a treebank POS tag to a WordNet POS."""
     if treebank_tag.startswith("J"):
         return "a"
     elif treebank_tag.startswith("V"):
@@ -359,15 +373,15 @@ def expand_keywords(
     normalized_question: str,
     verbose: bool = False,
 ) -> tuple[list[list[str]], list[str]]:
-    """扩展关键词变体并分类。
+    """Expand keyword variants and classify them.
 
     Returns:
         (expanded_keyword_list, keyword_type_list):
-        - expanded_keyword_list: 每个关键词的变体列表(含原词)
-        - keyword_type_list: 每个关键词的类型(special/superlative/general/numeric/adjective)
+        - expanded_keyword_list: list of variants for each keyword (including the original)
+        - keyword_type_list: type of each keyword (special/superlative/general/numeric/adjective)
     """
     if not _pattern_available:
-        # pattern.en 不可用时,不做词形变体扩展
+        # No morphological variant expansion when pattern.en is unavailable
         keyword_types = []
         for kw in keyword_list:
             if kw[0].isupper():
@@ -447,7 +461,7 @@ def count_keyword_scores(
     expanded_keyword_list: list[list[str]],
     keyword_type_list: list[str],
 ) -> float:
-    """计算文本中关键词命中的加权分数。"""
+    """Compute the weighted keyword-hit score in the text."""
     text = text.lower()
     score = 0.0
     tokenizer = SimpleTokenizer()
@@ -464,7 +478,7 @@ def count_keyword_scores(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 时间系数计算(移植自 metriever.py 原始实现)
+# Temporal coefficient computation (ported from the original metriever.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_spline_function(
@@ -472,11 +486,12 @@ def get_spline_function(
     implicit_condition: str | None,
     question_years: list[int],
 ) -> Callable:
-    """构造时间系数的线性插值函数。
+    """Build a linear interpolation function for temporal coefficients.
 
-    窗口内的系数在 TEMPORAL_LOW(0.6) 到 1.0 之间线性变化:
-    - implicit_condition='first': 偏好较早年份(从 1.0 下降到 0.6)
-    - 其他(含 'last'):偏好较晚年份(从 0.6 上升到 1.0)
+    The coefficient within the window varies linearly between TEMPORAL_LOW
+    (0.6) and 1.0:
+    - implicit_condition='first': favors earlier years (decreasing from 1.0 to 0.6)
+    - Otherwise (including 'last'): favors later years (increasing from 0.6 to 1.0)
     """
     from scipy.interpolate import interp1d
     import numpy as np
@@ -510,13 +525,14 @@ def get_temporal_coeffs(
     implicit_condition: str | None,
     spline: Callable,
 ) -> list[float]:
-    """对每个句子计算时间系数。
+    """Compute the temporal coefficient for each sentence.
 
-    逻辑:
-    1. 从句子文本中提取年份
-    2. 按时间关系类型筛选合规年份
-    3. 根据 implicit_condition 选择代表年份(最早或最晚)
-    4. 用 spline 函数计算系数;无合规年份或超出区间时回退为 0.5
+    Logic:
+    1. Extract years from the sentence text
+    2. Filter eligible years according to the temporal relation type
+    3. Select the representative year (earliest or latest) based on implicit_condition
+    4. Compute the coefficient with the spline function; fall back to 0.5 when
+       there is no eligible year or the value is out of range
     """
     temporal_coeffs: list[float] = []
     for _, snt, _ in sentence_tuples:
@@ -557,11 +573,11 @@ def get_temporal_coeffs(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# LLM Prompt 生成(移植自 prompts.py)
+# LLM prompt generation (ported from prompts.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_keyword_prompt(question: str) -> str:
-    """生成关键词抽取的 LLM prompt。"""
+    """Generate the LLM prompt for keyword extraction."""
     return f"""Your task is to extract keywords from the question. Response by a list of keyword strings. Do not include pronouns, prepositions, articles.
 
 There are some examples for you to refer to:
@@ -608,9 +624,10 @@ Who runs the fastest 40-yard dash in the NFL?
 
 
 def get_qfs_prompt(document: str, question: str) -> str:
-    """生成 QFS(Query-Focused Summarization)的 LLM prompt。
+    """Generate the LLM prompt for QFS (Query-Focused Summarization).
 
-    要求 LLM 保留关键日期,文档无关时返回 "None"。
+    The LLM is required to keep key dates and return "None" when the document
+    is irrelevant.
     """
     return f"""You are a summarizer summarizing a retrieved document about a user question. Keep the key dates in the summarization. Write "None" if the document has no relevant content about the question.
 
@@ -636,12 +653,12 @@ David Beckham played for Real Madrid from 2003 to 2007 and for LA Galaxy from Ju
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 数据类定义
+# Dataclass definitions
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Passage:
-    """单个 passage 候选。"""
+    """A single passage candidate."""
     id: str
     title: str
     text: str
@@ -652,7 +669,7 @@ class Passage:
 
 @dataclass
 class TemporalInfo:
-    """从问题中解析出的时间信息。"""
+    """Temporal information parsed from the question."""
     time_relation: str = ""
     time_relation_type: str = ""
     years: list[int] = field(default_factory=list)
@@ -662,38 +679,39 @@ class TemporalInfo:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MRAGRetriever 主类
+# MRAGRetriever main class
 # ═══════════════════════════════════════════════════════════════════════════
 
 class MRAGRetriever:
-    """独立、可复用的 MRAG 时间感知检索器。
+    """Standalone, reusable MRAG time-aware retriever.
 
-    保留 MRAG 的核心检索管道:
+    Preserves the core MRAG retrieval pipeline:
 
-    1. **初始检索**(BM25 via Pyserini 或 nuggetindex store 后端)
-    2. **关键词排序**:对候选 passage 计算关键词加权命中分数
-    3. **语义排序**:使用 CrossEncoder / embedding 模型重排
-    4. **QFS 摘要**:LLM 为 top-k passage 生成问题聚焦摘要
-    5. **句子关键词排序**:句子级关键词命中 + 摘要参与排序
-    6. **时间-语义混合排序**:
+    1. **Initial retrieval** (BM25 via Pyserini or the nuggetindex store backend)
+    2. **Keyword ranking**: compute keyword-weighted hit scores for candidate passages
+    3. **Semantic ranking**: rerank with CrossEncoder / embedding models
+    4. **QFS summarization**: the LLM generates question-focused summaries for the top-k passages
+    5. **Sentence-level keyword ranking**: sentence-level keyword hits plus summaries participating in ranking
+    6. **Temporal-semantic hybrid ranking**:
        ``final_score = hybrid_base * semantic + (1-hybrid_base) * semantic * temporal_coeff``
 
-    兼容 ``scripts/run_benchmark_jstrag.py`` 的 ``retriever_factory`` 配置。
-    通过 :func:`create_mrag_retriever` 工厂函数注入 nuggetindex store。
+    Compatible with the ``retriever_factory`` configuration of
+    ``scripts/run_benchmark_jstrag.py``.
+    The nuggetindex store is injected through the :func:`create_mrag_retriever` factory function.
 
     Args:
-        bm25_index_path: Pyserini Lucene 索引路径(独立模式)。
-        reranker_model_name: 语义重排模型名称(HF 模型 ID)。
-        reranker_type: 重排模型类型:``cross_encoder`` / ``bge`` / ``nv_embed`` / ``sfr`` / ``jina``。
-        llm: 生成模型实例(用于关键词抽取和 QFS);为 None 时跳过这两步。
-        ctx_topk: 关键词排序后保留的 passage 数(默认 100)。
-        qfs_topk: 生成 QFS 摘要的 passage 数(默认 5)。
-        snt_topk: 进入混合排序的句子数(默认 200)。
-        hybrid_score: 是否启用语义-时间混合分数(默认 True)。
-        hybrid_base: 混合公式中语义分数的最低保留比例(默认 0.0)。
-        snt_with_title: 是否在句子前附加 passage 标题(默认 True)。
-        store: NuggetStore 实例(nuggetindex 集成模式);为 None 时使用独立模式。
-        device: 模型设备(如 "cuda:0");为 None 时自动选择。
+        bm25_index_path: Path to the Pyserini Lucene index (standalone mode).
+        reranker_model_name: Name of the semantic reranking model (HF model ID).
+        reranker_type: Reranking model type: ``cross_encoder`` / ``bge`` / ``nv_embed`` / ``sfr`` / ``jina``.
+        llm: Generative model instance (used for keyword extraction and QFS); these two steps are skipped when it is None.
+        ctx_topk: Number of passages retained after keyword ranking (default 100).
+        qfs_topk: Number of passages for which QFS summaries are generated (default 5).
+        snt_topk: Number of sentences entering hybrid ranking (default 200).
+        hybrid_score: Whether to enable the semantic-temporal hybrid score (default True).
+        hybrid_base: Minimum retained fraction of the semantic score in the hybrid formula (default 0.0).
+        snt_with_title: Whether to prepend the passage title to sentences (default True).
+        store: NuggetStore instance (nuggetindex integration mode); standalone mode is used when None.
+        device: Model device (e.g. "cuda:0"); selected automatically when None.
     """
 
     def __init__(
@@ -733,33 +751,34 @@ class MRAGRetriever:
         self._hybrid_score = hybrid_score
         self._hybrid_base = hybrid_base
         self._snt_with_title = snt_with_title
-        # 关键词抽取/QFS 的采样温度:0 为贪婪解码(评估可复现),默认 0.2 保持原行为
+        # Sampling temperature for keyword extraction/QFS: 0 means greedy decoding
+        # (reproducible evaluation); the default 0.2 preserves the original behavior
         self._llm_temperature = llm_temperature
         self._store = store
         self._device = device
 
-        # 懒加载的模型实例
+        # Lazily loaded model instances
         self._bm25_searcher = None
         self._reranker_model = None
         self._reranker_tokenizer = None
         self._tokenizer = SimpleTokenizer()
 
-        # 关键词缓存(按 normalized_question)
+        # Keyword cache (keyed by normalized_question)
         self._keyword_cache: dict[str, tuple[list[list[str]], list[str]]] = {}
 
     # ───────────────────────────────────────────────────────────────────────
-    # 模型懒加载
+    # Lazy model loading
     # ───────────────────────────────────────────────────────────────────────
 
     def _load_bm25_searcher(self):
-        """加载 Pyserini LuceneSearcher。"""
+        """Load the Pyserini LuceneSearcher."""
         if self._bm25_searcher is None and self._bm25_index_path:
             from pyserini.search.lucene import LuceneSearcher
             self._bm25_searcher = LuceneSearcher(self._bm25_index_path)
         return self._bm25_searcher
 
     def _load_reranker(self):
-        """加载语义重排模型。"""
+        """Load the semantic reranking model."""
         if self._reranker_model is not None or self._reranker_model_name is None:
             return self._reranker_model
 
@@ -801,15 +820,15 @@ class MRAGRetriever:
         return self._reranker_model
 
     # ───────────────────────────────────────────────────────────────────────
-    # 初始检索模块(Initial Retrieval)
+    # Initial retrieval module
     # ───────────────────────────────────────────────────────────────────────
 
     async def _store_bm25_search(self, query: str, top_k: int = 1000) -> list[Passage]:
-        """通过 nuggetindex store 后端执行 BM25 检索(集成模式)。
+        """Perform BM25 search through the nuggetindex store backend (integration mode).
 
-        从 store 后端获取 BM25 候选 nugget ID,然后:
-        1. 用 ``aget_passages`` 获取完整 passage 文本
-        2. 按 source_id 聚合为 passage,用完整文本作为检索单元
+        Obtain BM25 candidate nugget IDs from the store backend, then:
+        1. Fetch the full passage text with ``aget_passages``
+        2. Aggregate by source_id into passages, using the full text as the retrieval unit
         """
         if self._store is None:
             return []
@@ -817,9 +836,11 @@ class MRAGRetriever:
         if backend is None:
             return []
 
-        # BM25 检索(与原始 MRAG 一致:不做前置时间过滤,时间感知在句子级混合排序阶段处理)
-        # FTS5 sanitize(去特殊符号 + OR join)在此处完成:上层传入的是原始 query,
-        # 以保留 "as of" 等时间触发词短语供 parse_temporal_question 检测。
+        # BM25 search (consistent with the original MRAG: no upfront temporal
+        # filtering; time-awareness is handled at the sentence-level hybrid ranking stage)
+        # FTS5 sanitization (stripping special symbols + OR join) happens here:
+        # the upper layer passes in the raw query, to preserve temporal trigger
+        # phrases such as "as of" for parse_temporal_question to detect.
         fts_query = sanitize_fts_query(query)
         if not fts_query:
             return []
@@ -834,7 +855,7 @@ class MRAGRetriever:
         if not bm25_results:
             return []
 
-        # 2. 获取 nugget 对象,提取 source_id
+        # 2. Fetch the nugget objects and extract source_id
         source_ids: set[str] = set()
         nugget_by_source: dict[str, list[tuple[str, float]]] = {}
         for nugget_id, score in bm25_results:
@@ -851,20 +872,20 @@ class MRAGRetriever:
         if not source_ids:
             return []
 
-        # 3. 获取完整 passage 文本
+        # 3. Fetch the full passage text
         try:
             passages_text = await backend.aget_passages(source_ids)
         except Exception as exc:
             logger.warning("aget_passages 失败: %s,回退到 nugget fact text", exc)
             passages_text = {}
 
-        # 4. 构建 Passage 对象(按 source_id 聚合)
+        # 4. Build Passage objects (aggregated by source_id)
         passages: list[Passage] = []
         for sid, nugget_hits in nugget_by_source.items():
-            # 使用完整 passage 文本;回退到 nugget fact text
+            # Use the full passage text; fall back to the nugget fact text
             text = passages_text.get(sid, "")
             if not text:
-                # 回退:拼接该 source 的 nugget fact text
+                # Fallback: concatenate the nugget fact texts of this source
                 fact_texts = []
                 for nid, _ in nugget_hits:
                     try:
@@ -878,15 +899,17 @@ class MRAGRetriever:
             if not text:
                 continue
 
-            # 取该 source 下 BM25 最高的 nugget 的分数作为 passage 分数
+            # Use the score of the highest-BM25-scoring nugget under this source
+            # as the passage score
             best_score = max(s for _, s in nugget_hits)
             best_nugget_id = max(nugget_hits, key=lambda x: x[1])[0]
-            # store 集成模式下 passage 默认不带标题,而重排器
-            # (rank_by_semantic / snt_with_title 的时间系数口径)按
-            # ``title + " " + text`` 建模;代词段与列表答案单元格缺了
-            # 归属实体后语义分会被打到 −9 量级。设置
-            # MRAG_TITLE_FROM_SOURCE_ID=true 可按 TimeQA source_id
-            # 还原标题(默认关闭,保持既有 benchmark 可比)。
+            # In store integration mode passages carry no title by default,
+            # while the rerankers (rank_by_semantic / the temporal coefficient
+            # convention of snt_with_title) model ``title + " " + text``;
+            # pronoun-only passages and list-answer cells missing the owning
+            # entity get their semantic score driven down to the order of -9.
+            # Setting MRAG_TITLE_FROM_SOURCE_ID=true restores the title from the
+            # TimeQA source_id (disabled by default to keep existing benchmarks comparable).
             title = ""
             if os.getenv("MRAG_TITLE_FROM_SOURCE_ID", "").strip().lower() in (
                 "1", "true", "yes", "on",
@@ -908,12 +931,13 @@ class MRAGRetriever:
         return passages[:top_k]
 
     def _bm25_search(self, query: str, top_k: int = 1000) -> list[Passage]:
-        """使用 Pyserini LuceneSearcher 执行 BM25 检索(独立模式)。
+        """Perform BM25 search with the Pyserini LuceneSearcher (standalone mode).
 
-        初始化参数:仅传入 Lucene 索引路径。
-        调用方法:``searcher.search(question, k=topk)``。
-        返回结果:每个 hit 包含 ``docid``(格式 "id::title")、``score``;
-        通过 ``searcher.doc(id).raw()`` 获取原文 JSON,解析 ``['contents']`` 取文本。
+        Initialization arguments: only the Lucene index path is passed in.
+        Calling method: ``searcher.search(question, k=topk)``.
+        Returned results: each hit contains ``docid`` (format "id::title") and
+        ``score``; the raw JSON is obtained via ``searcher.doc(id).raw()`` and
+        parsed at ``['contents']`` to get the text.
         """
         import json
         searcher = self._load_bm25_searcher()
@@ -944,44 +968,46 @@ class MRAGRetriever:
         candidates: list[Passage] | None = None,
         top_k: int = 1000,
     ) -> list[Passage]:
-        """初始检索:BM25(集成模式优先,独立模式兜底)。
+        """Initial retrieval: BM25 (integration mode first, standalone mode as fallback).
 
-        - 若 ``candidates`` 非空(预加载模式),直接使用。
-        - 否则优先使用 nuggetindex store 的后端 BM25(集成模式)。
-        - 否则使用 Pyserini LuceneSearcher(独立模式)。
+        - If ``candidates`` is non-empty (preloaded mode), use it directly.
+        - Otherwise, prefer the backend BM25 of the nuggetindex store (integration mode).
+        - Otherwise, use the Pyserini LuceneSearcher (standalone mode).
         """
         if candidates is not None:
             return candidates[:top_k]
 
         passages: list[Passage] = []
 
-        # 集成模式:从 nuggetindex store 后端获取 BM25 候选
+        # Integration mode: fetch BM25 candidates from the nuggetindex store backend
         if self._store is not None:
             passages = await self._store_bm25_search(query, top_k=top_k)
 
-        # 独立模式:使用 Pyserini LuceneSearcher
+        # Standalone mode: use the Pyserini LuceneSearcher
         if not passages and self._bm25_index_path:
             passages = self._bm25_search(query, top_k=top_k)
 
         return passages[:top_k]
 
     # ───────────────────────────────────────────────────────────────────────
-    # 时间感知重排序模块(Temporal-aware Reranking)
+    # Temporal-aware reranking module
     # ───────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _detect_time_relation(
         question: str,
     ) -> tuple[str, str, str] | None:
-        """当调用方未显式给出 ``time_relation`` 时,从问题文本中自动检测。
+        """Auto-detect from the question text when the caller does not provide ``time_relation`` explicitly.
 
-        扫描策略:多词触发词优先(按长度降序)、词边界匹配、大小写不敏感;
-        仅当触发词**之后的文本能解析出至少一个四位年份**时才采纳,
-        以排除 "a book by John" 这类非时间用法的误命中。
+        Scanning strategy: multi-word triggers first (in descending length
+        order), word-boundary matching, case-insensitive; a trigger is accepted
+        only when **the text after it can be parsed into at least one four-digit year**,
+        to avoid false hits from non-temporal usages such as "a book by John".
 
         Returns:
-            ``(trigger_lower, date_suffix, prefix)``:触发词(小写,供分类)、
-            触发词之后的日期文本、触发词之前的问题文本;未命中返回 None。
+            ``(trigger_lower, date_suffix, prefix)``: the trigger (lowercase,
+            for classification), the date text after the trigger, and the
+            question text before the trigger; returns None on no match.
         """
         lower = question.lower()
         for trigger in sorted(set(_TIME_RELATION_TRIGGERS), key=len, reverse=True):
@@ -995,15 +1021,16 @@ class MRAGRetriever:
     def parse_temporal_question(
         self, question: str, time_relation: str = "",
     ) -> TemporalInfo:
-        """解析问题中的时间信息。
+        """Parse temporal information in the question.
 
-        ``time_relation`` 为空时自动从问题中检测触发词
-        (as of / before / after / since / until / from / by),
-        与原始 MRAG 数据集自带 ``time_relation`` 字段的解析分支一致。
+        When ``time_relation`` is empty, trigger words are auto-detected from
+        the question (as of / before / after / since / until / from / by),
+        consistent with the parsing branch for the ``time_relation`` field
+        included in the original MRAG dataset.
 
         Returns:
-            TemporalInfo: 包含 time_relation_type, years, months,
-            implicit_condition, normalized_question。
+            TemporalInfo: containing time_relation_type, years, months,
+            implicit_condition, normalized_question.
         """
         time_relation = time_relation.strip()
         time_relation_type = ""
@@ -1013,13 +1040,13 @@ class MRAGRetriever:
         date = ""
 
         if time_relation and time_relation in question:
-            # 显式传入(原始 MRAG 数据集字段路径)
+            # Explicitly provided (field path of the original MRAG dataset)
             parts = question.split(time_relation)
             no_time_question = time_relation.join(parts[:-1])
             date = parts[-1]
             time_relation = time_relation.lower()
         elif not time_relation:
-            # 集成路径(nuggetindex aretrieve 只有 query 文本):自动检测
+            # Integration path (nuggetindex aretrieve has only the query text): auto-detect
             detected = self._detect_time_relation(question)
             if detected is not None:
                 time_relation, date, no_time_question = detected
@@ -1038,7 +1065,7 @@ class MRAGRetriever:
             else:
                 time_relation_type = "other"
 
-            # 月份解析(当前未参与最终排序,但保留以供扩展)
+            # Month parsing (currently not used in final ranking, but retained for extensibility)
             def _append_month(month_str: str):
                 m = find_month(month_str)
                 months.append(m if m else 0)
@@ -1056,14 +1083,16 @@ class MRAGRetriever:
             else:
                 _append_month(date.strip())
 
-        # 清理触发词被切除后残留的尾部空白与悬空开括号
-        # (如 "Who was CEO? (as of 2018)" → prefix 末尾的 "(")。
+        # Clean up trailing whitespace and dangling opening parentheses left
+        # after the trigger is excised (e.g. "Who was CEO? (as of 2018)" →
+        # the trailing "(" of the prefix).
         if time_relation:
             no_time_question = re.sub(r"[\s(]+$", "", no_time_question)
 
         normalized_question, implicit_condition = remove_implicit_condition(no_time_question)
-        # 时间状语前置(如 "As of 2018, who was CEO?")会导致去时间后为空,
-        # 此时回退到原始问题,避免语义排序拿到空 query。
+        # A fronted temporal adverbial (e.g. "As of 2018, who was CEO?") leaves
+        # an empty string after time removal; in that case fall back to the
+        # original question to avoid feeding an empty query to semantic ranking.
         if not normalized_question:
             normalized_question = question.rstrip()
         if normalized_question and normalized_question[-1] in ".?!":
@@ -1079,15 +1108,16 @@ class MRAGRetriever:
         )
 
     async def aextract_keywords(self, normalized_question: str) -> tuple[list[list[str]], list[str]]:
-        """从问题中抽取并扩展关键词。
+        """Extract and expand keywords from the question.
 
-        若 LLM 可用,使用 LLM 生成关键词;否则使用简单的非停用词提取。
-        结果按 normalized_question 缓存。
+        If the LLM is available, it is used to generate keywords; otherwise
+        simple non-stopword extraction is used.
+        Results are cached by normalized_question.
         """
         if normalized_question in self._keyword_cache:
             return self._keyword_cache[normalized_question]
 
-        # 规范化特殊问题前缀
+        # Normalize special question prefixes
         q = normalized_question
         if q.startswith("How many times"):
             q = q.replace("How many times", "When")
@@ -1098,7 +1128,8 @@ class MRAGRetriever:
         if not keyword_list:
             keyword_list = self._simple_extract_keywords(q)
 
-        # 后处理:过滤低信息词,确保是原问题子串
+        # Post-processing: filter out low-information words and ensure keywords
+        # are substrings of the original question
         revised = []
         for kw in keyword_list:
             if kw in EXCL:
@@ -1114,7 +1145,7 @@ class MRAGRetriever:
         return expanded, types
 
     async def _allm_extract_keywords(self, question: str) -> list[str]:
-        """使用 LLM 抽取关键词。"""
+        """Extract keywords using the LLM."""
         if self._llm is None:
             return []
         prompt = get_keyword_prompt(question)
@@ -1125,13 +1156,13 @@ class MRAGRetriever:
             if start == -1 or end == -1:
                 return []
             tmp = response[start : end + 1]
-            return list(eval(tmp))  # noqa: S307 (LLM 输出为 Python list 字面量)
+            return list(eval(tmp))  # noqa: S307 (LLM output is a Python list literal)
         except Exception:
             logger.warning("LLM 关键词抽取失败,回退到简单关键词提取", exc_info=True)
             return []
 
     def _simple_extract_keywords(self, question: str) -> list[str]:
-        """简单关键词提取(无 LLM 时的兜底)。"""
+        """Simple keyword extraction (fallback when no LLM is available)."""
         tokens = word_tokenize(question)
         tagged = pos_tag(tokens)
         keywords = []
@@ -1141,22 +1172,25 @@ class MRAGRetriever:
         return keywords
 
     async def _acall_llm(self, prompts: list[str], max_tokens: int = 100) -> list[str]:
-        """异步调用 LLM 生成文本。
+        """Call the LLM asynchronously to generate text.
 
-        按以下顺序识别 ``self._llm`` 的接口(鸭子类型):
+        The interface of ``self._llm`` is identified in the following order
+        (duck typing):
 
-        1. 框架 :class:`~tcrag.llm.base.BaseLLM`(有 ``agenerate``,
-           如 OpenAI / Ollama 客户端)——必须最先检测:``BaseLLM`` 同时
-           带有同步 ``generate()`` 包装,放后面会被误判为 vLLM。
-        2. vLLM 离线引擎(同步 ``generate(prompts, SamplingParams)``),
-           用 ``asyncio.to_thread`` 包裹避免阻塞事件循环。
-        3. 裸 OpenAI 兼容客户端(``chat.completions.create``)。
+        1. The framework :class:`~tcrag.llm.base.BaseLLM` (with ``agenerate``,
+           e.g. the OpenAI / Ollama clients) -- must be checked first:
+           ``BaseLLM`` also exposes a synchronous ``generate()`` wrapper, so
+           checking it later would misidentify it as vLLM.
+        2. The vLLM offline engine (synchronous
+           ``generate(prompts, SamplingParams)``), wrapped with
+           ``asyncio.to_thread`` to avoid blocking the event loop.
+        3. A bare OpenAI-compatible client (``chat.completions.create``).
         """
         if self._llm is None:
             return [""] * len(prompts)
 
         if hasattr(self._llm, "agenerate"):
-            # 框架统一 LLM 接口:agenerate(prompt, ...) -> LLMResponse
+            # Unified framework LLM interface: agenerate(prompt, ...) -> LLMResponse
             async def _one(prompt: str) -> str:
                 try:
                     resp = await self._llm.agenerate(
@@ -1170,7 +1204,7 @@ class MRAGRetriever:
 
             responses = list(await asyncio.gather(*(_one(p) for p in prompts)))
         elif hasattr(self._llm, "generate"):
-            # vLLM 离线引擎(同步阻塞,放线程池执行)
+            # vLLM offline engine (synchronous and blocking; run in a thread pool)
             try:
                 from vllm import SamplingParams
                 sampling_params = SamplingParams(
@@ -1185,7 +1219,7 @@ class MRAGRetriever:
                 logger.warning("vLLM generate 失败,全部返回空字符串", exc_info=True)
                 responses = [""] * len(prompts)
         else:
-            # OpenAI 兼容接口(裸同步 openai.OpenAI 客户端)
+            # OpenAI-compatible interface (bare synchronous openai.OpenAI client)
             responses = []
             model = getattr(self._llm, "model", "gpt-4o-mini")
             for prompt in prompts:
@@ -1201,13 +1235,13 @@ class MRAGRetriever:
                     logger.warning("OpenAI 兼容 LLM 单次调用失败,返回空字符串", exc_info=True)
                     responses.append("")
 
-        # 去除停止标记
+        # Strip stop markers
         for stopper in ["</Keywords>", "</Summarization>", "</Answer>", "</Info>"]:
             responses = [r.split(stopper)[0] if stopper in r else r for r in responses]
         return responses
 
     # ───────────────────────────────────────────────────────────────────────
-    # 重排步骤 1:Passage 关键词排序
+    # Reranking step 1: passage keyword ranking
     # ───────────────────────────────────────────────────────────────────────
 
     def rank_by_keywords(
@@ -1216,10 +1250,11 @@ class MRAGRetriever:
         expanded_keywords: list[list[str]],
         keyword_types: list[str],
     ) -> list[Passage]:
-        """Passage 关键词排序。
+        """Passage keyword ranking.
 
-        对每个 passage 计算 ``title + text`` 中命中的关键词权重之和,
-        按总分降序排列,保留前 ``ctx_topk`` 个。
+        For each passage, compute the sum of keyword weights hit in
+        ``title + text``, sort by total score in descending order, and keep the
+        top ``ctx_topk``.
         """
         scored = []
         for ctx in candidates:
@@ -1230,7 +1265,7 @@ class MRAGRetriever:
         return [tp[0] for tp in scored[: self._ctx_topk]]
 
     # ───────────────────────────────────────────────────────────────────────
-    # 重排步骤 2:Passage 语义排序
+    # Reranking step 2: passage semantic ranking
     # ───────────────────────────────────────────────────────────────────────
 
     def rank_by_semantic(
@@ -1239,10 +1274,12 @@ class MRAGRetriever:
         query: str,
         normalized: bool = False,
     ) -> list[Passage]:
-        """Passage 语义排序。
+        """Passage semantic ranking.
 
-        使用语义模型(CrossEncoder / BGE / NV-Embed)对 ``[query, title+text]`` 对打分。
-        ``normalized=True`` 时使用 normalized_question(去除时间短语)。
+        Scores ``[query, title+text]`` pairs using a semantic model
+        (CrossEncoder / BGE / NV-Embed).
+        Uses normalized_question (with temporal phrases removed) when
+        ``normalized=True``.
         """
         model = self._load_reranker()
         if model is None:
@@ -1260,7 +1297,7 @@ class MRAGRetriever:
     def _compute_semantic_scores(
         self, model_inputs: list[list[str]], query: str, candidates: list[Passage],
     ) -> list[float]:
-        """根据重排模型类型计算语义分数。"""
+        """Compute semantic scores according to the reranker model type."""
         name = self._reranker_model_name or ""
         model = self._reranker_model
 
@@ -1277,7 +1314,7 @@ class MRAGRetriever:
             return list(model.predict(model_inputs))
 
     def _nv_embed_scores(self, query: str, passages: list[str]) -> list[float]:
-        """NV-Embed 语义打分。"""
+        """NV-Embed semantic scoring."""
         task = "Given a question, retrieve passages that answer the question"
         query_prefix = f"Instruct: {task}\nQuery: "
         max_length = 512
@@ -1300,7 +1337,7 @@ class MRAGRetriever:
         return all_scores
 
     def _sfr_scores(self, query: str, passages: list[str]) -> list[float]:
-        """SFR Embedding 语义打分。"""
+        """SFR embedding semantic scoring."""
         task = "Given a web search query, retrieve relevant passages that answer the query"
         queries = [f"Instruct: {task}\nQuery: {query}"]
         max_length = 512
@@ -1323,7 +1360,7 @@ class MRAGRetriever:
 
     @staticmethod
     def _last_token_pool(last_hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
-        """SFR 的 last-token pooling。"""
+        """Last-token pooling for SFR."""
         left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
         if left_padding:
             return last_hidden_states[:, -1]
@@ -1334,15 +1371,16 @@ class MRAGRetriever:
         ]
 
     # ───────────────────────────────────────────────────────────────────────
-    # 重排步骤 3:QFS 摘要生成
+    # Reranking step 3: QFS summary generation
     # ───────────────────────────────────────────────────────────────────────
 
     async def generate_qfs_summaries(
         self, candidates: list[Passage], query: str, top_k: int | None = None,
     ) -> list[str | None]:
-        """为 top-k passage 生成 QFS 摘要。
+        """Generate QFS summaries for the top-k passages.
 
-        使用 LLM 生成保留关键日期的问题聚焦摘要;文档无关时返回 None。
+        Uses the LLM to produce question-focused summaries that retain key
+        dates; returns None when the document is irrelevant.
         """
         k = top_k or self._qfs_topk
         if self._llm is None or k <= 0:
@@ -1363,7 +1401,7 @@ class MRAGRetriever:
         return summaries
 
     # ───────────────────────────────────────────────────────────────────────
-    # 重排步骤 4:句子关键词排序
+    # Reranking step 4: sentence keyword ranking
     # ───────────────────────────────────────────────────────────────────────
 
     def rank_sentences_by_keywords(
@@ -1373,16 +1411,16 @@ class MRAGRetriever:
         expanded_keywords: list[list[str]],
         keyword_types: list[str],
     ) -> tuple[list[tuple[str, str, float]], dict[str, Passage]]:
-        """句子关键词排序。
+        """Sentence keyword ranking.
 
-        1. 用 sent_tokenize() 切分每个 passage 的句子
-        2. 可选地在每个句子前附加标题
-        3. 若 QFS 摘要不为 None,把摘要当作额外句子
-        4. 对所有句子计算关键词分数并全局排序
+        1. Split each passage into sentences with sent_tokenize()
+        2. Optionally prepend the title to each sentence
+        3. Treat the QFS summary as an additional sentence when it is not None
+        4. Compute keyword scores for all sentences and rank them globally
 
         Returns:
             (sentence_tuples, get_ctx_by_id):
-            - sentence_tuples: [(passage_id, sentence, kw_score), ...] 按分数降序
+            - sentence_tuples: [(passage_id, sentence, kw_score), ...] in descending score order
             - get_ctx_by_id: {passage_id: Passage}
         """
         get_ctx_by_id: dict[str, Passage] = {}
@@ -1408,7 +1446,7 @@ class MRAGRetriever:
         return sentence_tuples, get_ctx_by_id
 
     # ───────────────────────────────────────────────────────────────────────
-    # 重排步骤 5:时间-语义混合排序
+    # Reranking step 5: temporal-semantic hybrid ranking
     # ───────────────────────────────────────────────────────────────────────
 
     def hybrid_rank_sentences(
@@ -1419,15 +1457,17 @@ class MRAGRetriever:
         temporal_info: TemporalInfo,
         candidates: list[Passage],
     ) -> list[tuple[str, str, float]]:
-        """句子语义-时间混合排序。
+        """Sentence semantic-temporal hybrid ranking.
 
-        组合公式:
+        Combination formula:
         ``final_score = hybrid_base * semantic + (1-hybrid_base) * semantic * temporal_coeff``
 
-        默认 ``hybrid_base=0``,等价于 ``final_score = semantic * temporal_coeff``。
-        对无年份或 other 类型的问题,直接使用语义分数。
+        By default ``hybrid_base=0``, equivalent to
+        ``final_score = semantic * temporal_coeff``.
+        For questions without a year or of the other type, the semantic score
+        is used directly.
         """
-        # 截取 top-snt_topk 句子,其余保持原序
+        # Keep the top snt_topk sentences; the rest retain their original order
         snt_topk = min(len(sentence_tuples), self._snt_topk)
         sentence_tuples_unchange = sentence_tuples[snt_topk:]
         sentence_tuples = sentence_tuples[:snt_topk]
@@ -1436,7 +1476,7 @@ class MRAGRetriever:
         time_relation_type = temporal_info.time_relation_type
         implicit_condition = temporal_info.implicit_condition
 
-        # 决定使用 normalized_question 还是原始 question
+        # Decide whether to use normalized_question or the original question
         use_hybrid = (
             len(years) > 0
             and time_relation_type != "other"
@@ -1444,7 +1484,7 @@ class MRAGRetriever:
         )
         search_query = normalized_query if use_hybrid else query
 
-        # 计算语义分数
+        # Compute semantic scores
         model = self._load_reranker()
         if model is not None and sentence_tuples:
             model_inputs = [[search_query, tp[1]] for tp in sentence_tuples]
@@ -1457,10 +1497,10 @@ class MRAGRetriever:
                 semantic_scores = list(model.predict(model_inputs))
             semantic_scores = [float(s) for s in semantic_scores]
         else:
-            # 无模型时使用关键词分数作为语义分数的替代
+            # When no model is available, use keyword scores as a substitute for semantic scores
             semantic_scores = [tp[2] for tp in sentence_tuples]
 
-        # 计算时间系数并组合
+        # Compute temporal coefficients and combine
         if use_hybrid:
             spline = get_spline_function(time_relation_type, implicit_condition, years)
             temporal_coeffs = get_temporal_coeffs(
@@ -1473,7 +1513,7 @@ class MRAGRetriever:
         else:
             final_scores = semantic_scores
 
-        # 组装最终句子三元组
+        # Assemble the final sentence tuples
         sentence_tuples = [
             (tp[0], tp[1], score) for score, tp in zip(final_scores, sentence_tuples)
         ]
@@ -1482,7 +1522,7 @@ class MRAGRetriever:
         return sentence_tuples
 
     # ───────────────────────────────────────────────────────────────────────
-    # 主检索接口
+    # Main retrieval interface
     # ───────────────────────────────────────────────────────────────────────
 
     async def retrieve(
@@ -1493,43 +1533,44 @@ class MRAGRetriever:
         candidates: list[Passage] | None = None,
         top_k: int = 10,
     ) -> list[Passage]:
-        """执行完整的 MRAG 检索管道(独立模式)。
+        """Run the full MRAG retrieval pipeline (standalone mode).
 
         Args:
-            query: 查询文本。
-            time_relation: 时间关系词(如 "after", "before");为空时自动检测。
-            candidates: 预加载的候选 passage;为 None 时执行初始检索。
-            top_k: 返回的 passage 数量。
+            query: Query text.
+            time_relation: Temporal relation word (e.g. "after", "before"); auto-detected when empty.
+            candidates: Preloaded candidate passages; initial retrieval is performed when None.
+            top_k: Number of passages to return.
 
         Returns:
-            按 MRAG 最终排名排序的 passage 列表。
+            A list of passages ordered by the final MRAG ranking.
         """
-        # Step 0: 初始检索
+        # Step 0: initial retrieval
         initial_candidates = await self._initial_retrieval(query, candidates)
         if not initial_candidates:
             return []
 
-        # Step 1: 时间信息预处理
+        # Step 1: temporal information preprocessing
         temporal_info = self.parse_temporal_question(query, time_relation)
         normalized_question = temporal_info.normalized_question or query
 
-        # Step 2: 关键词抽取
-        # 提取出query里有意义的词语
-        # expended keywords: 基于query内原来的词语，联想出相关的词也加入关键词
+        # Step 2: keyword extraction
+        # Extract the meaningful words from the query
+        # expanded keywords: based on the original words in the query, associate
+        # related words and add them to the keyword set as well
         expanded_keywords, keyword_types = await self.aextract_keywords(normalized_question)
 
-        # Step 3: Passage 关键词排序 → top-ctx_topk
-        # 计数candidate里的query keyword的数量,并按数量排序
+        # Step 3: passage keyword ranking → top ctx_topk
+        # Count the query keywords in each candidate and sort by the count
         ctx_kw_ranked = self.rank_by_keywords(
             initial_candidates, expanded_keywords, keyword_types,
         )
 
-        # Step 4: Passage 语义排序 → 重排 top-ctx_topk
+        # Step 4: passage semantic ranking → rerank the top ctx_topk
         ctx_semantic_ranked = self.rank_by_semantic(
             ctx_kw_ranked, normalized_question, normalized=True,
         )
 
-        # Step 5: QFS 摘要生成
+        # Step 5: QFS summary generation
         summaries = await self.generate_qfs_summaries(
             ctx_semantic_ranked, normalized_question, top_k=self._qfs_topk,
         )
@@ -1537,17 +1578,17 @@ class MRAGRetriever:
             if i < len(ctx_semantic_ranked):
                 ctx_semantic_ranked[i].metadata["qfs_summary"] = s
 
-        # Step 6: 句子关键词排序
+        # Step 6: sentence keyword ranking
         sentence_tuples, get_ctx_by_id = self.rank_sentences_by_keywords(
             ctx_semantic_ranked, summaries, expanded_keywords, keyword_types,
         )
 
-        # Step 7: 时间-语义混合排序
+        # Step 7: temporal-semantic hybrid ranking
         final_sentence_tuples = self.hybrid_rank_sentences(
             sentence_tuples, query, normalized_question, temporal_info, ctx_semantic_ranked,
         )
 
-        # 根据 sentence rank 反推 passage rank
+        # Derive passage ranks from sentence ranks
         latest_ctxs: list[Passage] = []
         id_included: set[str] = set()
         for ctx_id, snt, score in final_sentence_tuples:
@@ -1570,32 +1611,32 @@ class MRAGRetriever:
         fusion: str = "rrf",
         filters: dict[str, Any] | None = None,
     ) -> list[Any]:
-        """NuggetIndex 集成接口(兼容 ``retriever_factory``)。
+        """NuggetIndex integration interface (compatible with ``retriever_factory``).
 
-        签名匹配 nuggetindex ``Retriever.aretrieve``,
-        返回 ``RetrievalResult`` 列表。
+        The signature matches nuggetindex ``Retriever.aretrieve``;
+        returns a list of ``RetrievalResult``.
         """
-        # 从 store 后端获取初始候选
+        # Fetch initial candidates from the store backend
         candidates = await self._initial_retrieval(query, top_k=max(top_k * 10, 1000))
 
         if not candidates:
             return []
 
-        # 执行 MRAG 管道
+        # Run the MRAG pipeline
         ranked_passages = await self.retrieve(
             query, candidates=candidates, top_k=top_k,
         )
 
-        # 转换为 RetrievalResult
+        # Convert to RetrievalResult
         return await self._to_retrieval_results(ranked_passages, top_k)
 
     async def _to_retrieval_results(
         self, passages: list[Passage], top_k: int,
     ) -> list[Any]:
-        """将 Passage 列表转换为 nuggetindex RetrievalResult。
+        """Convert a list of Passages into nuggetindex RetrievalResults.
 
-        优先从 store 后端获取原始 nugget(保留 provenance/validity),
-        找不到时构造新的 Nugget。
+        Prefer fetching the original nuggets from the store backend (preserving
+        provenance/validity); construct new Nuggets when they cannot be found.
         """
         try:
             from nuggetindex.retrieve.retriever import RetrievalResult
@@ -1617,11 +1658,11 @@ class MRAGRetriever:
         for i, p in enumerate(passages[:top_k]):
             nugget = None
 
-            # 尝试从 store 后端获取原始 nugget(保留 provenance/validity)
+            # Try to fetch the original nuggets from the store backend (preserving provenance/validity)
             if backend is not None:
                 nugget_ids = p.metadata.get("nugget_ids", [])
                 best_nid = p.metadata.get("best_nugget_id")
-                # 优先用 best_nugget_id,其次尝试列表中的第一个
+                # Prefer best_nugget_id, then try the first one in the list
                 candidates_ids = [best_nid] + [nid for nid in nugget_ids if nid != best_nid]
                 for nid in candidates_ids:
                     if not nid:
@@ -1635,7 +1676,7 @@ class MRAGRetriever:
                         continue
 
             if nugget is None:
-                # 回退:构造新的 Nugget
+                # Fallback: construct a new Nugget
                 nugget = Nugget.new(
                     kind=NuggetKind.SEMANTIC_FACT,
                     fact=FactTriple(
@@ -1661,13 +1702,14 @@ class MRAGRetriever:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NuggetIndex 集成工厂函数
+# NuggetIndex integration factory function
 # ═══════════════════════════════════════════════════════════════════════════
 
 def create_mrag_retriever(store: Any, *, llm: Any | None = None) -> MRAGRetriever:
-    """NuggetIndex 集成工厂函数。
+    """NuggetIndex integration factory function.
 
-    兼容 ``scripts/run_benchmark_jstrag.py`` 的 ``retriever_factory`` 配置:
+    Compatible with the ``retriever_factory`` configuration of
+    ``scripts/run_benchmark_jstrag.py``:
 
     .. code-block:: yaml
 
@@ -1675,37 +1717,39 @@ def create_mrag_retriever(store: Any, *, llm: Any | None = None) -> MRAGRetrieve
           nuggetindex:
             retriever_factory: "tcrag.retrievers.metriever:create_mrag_retriever"
 
-    签名: ``(store: NuggetStore, *, llm=None) -> MRAGRetriever``
-    返回的 MRAGRetriever 实现
-    ``async aretrieve(query, *, query_time, view, top_k, fusion, filters)``。
+    Signature: ``(store: NuggetStore, *, llm=None) -> MRAGRetriever``
+    The returned MRAGRetriever implements
+    ``async aretrieve(query, *, query_time, view, top_k, fusion, filters)``.
 
     Args:
-        store: NuggetStore 实例(nuggetindex 集成模式)。
-        llm: 生成模型实例,由外部 run_benchmark 脚本传入(与 QA 阶段共用);
-            用于关键词抽取和 QFS 摘要,为 None 时跳过这两步。
+        store: NuggetStore instance (nuggetindex integration mode).
+        llm: Generative model instance, passed in by the external run_benchmark
+            script (shared with the QA stage); used for keyword extraction and
+            QFS summarization; these two steps are skipped when None.
 
-    环境变量(可选):
-      - ``MRAG_BM25_INDEX_PATH``: Pyserini Lucene 索引路径(独立 BM25 检索)
-      - ``MRAG_RERANKER_MODEL``: 语义重排模型 HF 名称(默认 ``nvidia/NV-Embed-v2``,
-        参照 MRAG metriever.py 的默认 stage2 重排模型 metriever_model=nv2)
-      - ``MRAG_RERANKER_TYPE``: 重排模型类型(cross_encoder/bge/nv_embed/sfr/jina,
-        默认 nv_embed)
-      - ``MRAG_CTX_TOPK``: 关键词排序后保留的 passage 数(默认 100)
-      - ``MRAG_SNT_TOPK``: 进入混合排序的句子数(默认 200)
-      - ``MRAG_QFS_TOPK``: QFS 摘要的 passage 数(默认 5)
-      - ``MRAG_HYBRID_BASE``: 混合公式中语义分数的最低保留比例(默认 0.0)
-      - ``MRAG_LLM_TEMPERATURE``: 关键词抽取/QFS 的采样温度(默认 0.2);
-        评估复现可设 0(贪婪解码)
+    Environment variables (optional):
+      - ``BM25_INDEX_PATH``: Path to the Pyserini Lucene index (standalone BM25 retrieval)
+      - ``RERANKER_MODEL``: HF name of the semantic reranking model (default ``nvidia/NV-Embed-v2``,
+        following the default stage2 reranking model metriever_model=nv2 in MRAG metriever.py)
+      - ``RERANKER_TYPE``: Reranking model type (cross_encoder/bge/nv_embed/sfr/jina,
+        default nv_embed)
+      - ``MRAG_CTX_TOPK``: Number of passages retained after keyword ranking (default 100)
+      - ``MRAG_SNT_TOPK``: Number of sentences entering hybrid ranking (default 200)
+      - ``MRAG_QFS_TOPK``: Number of passages for QFS summarization (default 5)
+      - ``HYBRID_BASE``: Minimum retained fraction of the semantic score in the hybrid formula (default 0.0)
+      - ``MRAG_LLM_TEMPERATURE``: Sampling temperature for keyword extraction/QFS (default 0.2);
+        can be set to 0 (greedy decoding) for reproducible evaluation
     """
-    bm25_index = os.getenv("MRAG_BM25_INDEX_PATH")
-    # 默认 stage2 重排模型参照 MRAG metriever.py:metriever_model 默认 nv2
-    # → nvidia/NV-Embed-v2,对应 reranker_type=nv_embed。
-    reranker_model = os.getenv("MRAG_RERANKER_MODEL", "nvidia/NV-Embed-v2")
-    reranker_type = os.getenv("MRAG_RERANKER_TYPE", "nv_embed")
+    bm25_index = os.getenv("BM25_INDEX_PATH")
+    # The default stage2 reranking model follows MRAG metriever.py:
+    # metriever_model defaults to nv2 → nvidia/NV-Embed-v2, corresponding to
+    # reranker_type=nv_embed.
+    reranker_model = os.getenv("RERANKER_MODEL", "nvidia/NV-Embed-v2")
+    reranker_type = os.getenv("RERANKER_TYPE", "nv_embed")
     ctx_topk = int(os.getenv("MRAG_CTX_TOPK", "100"))
     snt_topk = int(os.getenv("MRAG_SNT_TOPK", "200"))
     qfs_topk = int(os.getenv("MRAG_QFS_TOPK", "5"))
-    hybrid_base = float(os.getenv("MRAG_HYBRID_BASE", "0.0"))
+    hybrid_base = float(os.getenv("HYBRID_BASE", "0.0"))
     llm_temperature = float(os.getenv("MRAG_LLM_TEMPERATURE", "0.2"))
 
     logger.info(

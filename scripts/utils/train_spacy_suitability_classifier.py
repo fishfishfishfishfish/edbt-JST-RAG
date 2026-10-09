@@ -1,60 +1,67 @@
-"""训练二分类器:判断文档是否适合直接用 ``SpacyFactExtractor`` 提取事实。
+"""Train a binary classifier that decides whether a document is suitable for
+fact extraction directly with ``SpacyFactExtractor``.
 
-弱监督标签(按提取事实数量)
-==========================
+Weakly supervised labels (based on extracted fact counts)
+=========================================================
 
-对每个加载后的 passage,分别运行:
+For each loaded passage, run both:
 
-- :class:`tcrag.extractors.spacy_extractor.SpacyFactExtractor`(免费、本地);
-- nuggetindex 原生 LLMExtractor 链路(
-  ``llama3.2`` + ``OllamaCompatClient`` json_schema
-  约束解码 + PlaceholderValidity 包装器,``--max-tokens 4096``)。
+- :class:`tcrag.extractors.spacy_extractor.SpacyFactExtractor` (free, local);
+- the native nuggetindex LLMExtractor pipeline (``llama3.2`` +
+  ``OllamaCompatClient`` json_schema constrained decoding + the
+  PlaceholderValidity wrapper, ``--max-tokens 4096``).
 
-标注规则(``--label-gap-threshold``,默认 0)::
+Labeling rule (``--label-gap-threshold``, default 0)::
 
-    y = 1(适合 spacy)  当 n_spacy >= n_llm
-                        或 n_llm - n_spacy <= label_gap_threshold
-    y = 0(负样本)      其他情况
+    y = 1 (spacy-suitable)  when n_spacy >= n_llm
+                             or n_llm - n_spacy <= label_gap_threshold
+    y = 0 (negative)        otherwise
 
-即允许 spacy 比 LLM 少提 ``label_gap_threshold`` 条事实仍算正样本;
-threshold=0 时退化为原规则 ``n_spacy >= n_llm``。缓存只存计数
-``n_spacy`` / ``n_llm``,训练时按当前 threshold 重算标签,因此调整
-threshold 重训无需重新调用 LLM 标注。
+That is, spacy may extract up to ``label_gap_threshold`` fewer facts than the
+LLM and the passage still counts as a positive; with threshold=0 the rule
+degrades to the original ``n_spacy >= n_llm``. The cache stores only the
+counts ``n_spacy`` / ``n_llm``, and labels are recomputed at training time with
+the current threshold, so retraining with an adjusted threshold requires no
+new LLM labeling calls.
 
-注意:LLM 提取器解析失败时按生产行为返回空列表(``n_llm=0``),此时
-passage 会被标为正样本——这符合规则字面含义,也是"spacy 不比 LLM
-差太多"的弱监督口径。
+Note: when the LLM extractor fails to parse, it returns an empty list in line
+with production behavior (``n_llm=0``), and the passage is then labeled
+positive — this follows the literal meaning of the rule and reflects the weakly
+supervised interpretation that "spacy is not much worse than the LLM".
 
-两个阶段
-========
+Two stages
+==========
 
-1. **label**:用 ``load_timeqa`` / ``load_tempevalrag`` 加载 passage,
-   并发跑两个提取器,结果**增量追加**到 JSONL 缓存(含原文与计数),
-   中断后再次运行会跳过已标注 passage,可长期增量积累。
-2. **train**:读缓存 → 按 text_hash 去重 → 分层 train/test split →
-   TF-IDF(word 1-2gram + char 3-5gram)+ 文档统计特征 →
-   :class:`sklearn.linear_model.LogisticRegression` → 打印
-   precision/recall/F1/混淆矩阵 → joblib 保存到 ``models/``。
+1. **label**: load passages with ``load_timeqa`` / ``load_tempevalrag``, run
+   the two extractors concurrently, and **incrementally append** the results
+   to the JSONL cache (including the raw text and counts); rerunning after an
+   interruption skips passages already labeled, allowing long-term incremental
+   accumulation.
+2. **train**: read the cache → deduplicate by text_hash → stratified
+   train/test split → TF-IDF (word 1-2gram + char 3-5gram) plus document
+   statistics features → :class:`sklearn.linear_model.LogisticRegression` →
+   print precision/recall/F1/confusion matrix → save with joblib into
+   ``models/``.
 
-运行(需在 tcrag conda 环境内、ollama 已启动)::
+Running (inside the tcrag conda environment, with ollama started)::
 
     conda activate tcrag
 
-    # 小规模试跑(每个数据集取 100 段)
+    # Small trial run (take 100 passages per dataset)
     python scripts/utils/train_spacy_suitability_classifier.py \
         --limit-per-dataset 100 --workers 3
 
-    # 全量增量标注(可多次中断、续跑;不训练)
+    # Full incremental labeling (can be interrupted and resumed repeatedly; no training)
     python scripts/utils/train_spacy_suitability_classifier.py --label-only
 
-    # 只用缓存训练(不再调用 LLM)
+    # Train from the cache only (no further LLM calls)
     python scripts/utils/train_spacy_suitability_classifier.py --no-label
 
-    # 放宽正样本口径(spacy 少提 <=2 条也算正样本),直接用缓存计数重算标签重训
+    # Relax the positive rule (spacy extracting <=2 fewer facts still counts as positive), recompute labels directly from cached counts and retrain
     python scripts/utils/train_spacy_suitability_classifier.py \
         --no-label --label-gap-threshold 2
 
-推理时加载(经 ``load_classifier`` 以正确反序列化自定义特征类)::
+Loading at inference time (via ``load_classifier`` so the custom feature class is deserialized correctly)::
 
     import sys
     sys.path.insert(0, "scripts/utils")
@@ -77,13 +84,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-# 直接以 ``python scripts/utils/xxx.py`` 运行时,仓库根目录不在 sys.path 中。
-# scripts/utils/<file>.py: parents[0]=utils, parents[1]=scripts, parents[2]=仓库根。
+# When run directly as ``python scripts/utils/xxx.py``, the repository root is not on sys.path.
+# scripts/utils/<file>.py: parents[0]=utils, parents[1]=scripts, parents[2]=repository root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# 本地 Ollama 服务不走系统代理(VPN/代理环境下否则会拦截 localhost 请求)。
+# The local Ollama service must bypass the system proxy (otherwise VPN/proxy setups intercept localhost requests).
 os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
 
@@ -99,14 +106,16 @@ _DEFAULT_CACHE = _REPO_ROOT / "data" / "spacy_suitability_labels.jsonl"
 _DEFAULT_MODEL_OUT = _REPO_ROOT / "models" / "spacy_suitability_logreg.joblib"
 
 
-# ── 特征:文档统计量 ─────────────────────────────────────────────────────
+# ── Features: document statistics ───────────────────────────────────────
 
 class TextStats:
-    """从纯文本抽取的浅层风格特征(spacy 擅长简单 SVO / 名词性事实,
-    在代词多、句子长、数字密度低的文本上产出会明显变少)。
+    """Shallow stylistic features extracted from plain text (spacy excels at simple
+    SVO / nominal facts and produces markedly fewer facts on text with many
+    pronouns, long sentences and low numeric density).
 
-    输出 8 个特征:log 字符数、log 词数、平均词长、平均句长、
-    代词比例、数字词比例、首字母大写词比例、逗号密度。
+    Outputs 8 features: log character count, log word count, average word length,
+    average sentence length, pronoun ratio, numeric-word ratio, capitalized-word
+    ratio and comma density.
     """
 
     _PRONOUNS = {
@@ -163,26 +172,26 @@ class TextStats:
         )
 
 
-# joblib 反序列化兼容性:脚本直接运行时 ``__name__ == "__main__"``,
-# pickle 会把 TextStats 记成 ``__main__.TextStats``,外部代码加载时找
-# 不到该类。固定其归属模块名,并把当前模块注册到 sys.modules,使
-# ``import train_spacy_suitability_classifier`` 后即可 joblib.load。
+# joblib deserialization compatibility: when the script runs directly,
+# ``__name__ == "__main__"``, pickle records TextStats as ``__main__.TextStats``,
+# which external code cannot resolve when loading. Pin its owning module name and
+# register the current module in sys.modules so joblib.load works after ``import train_spacy_suitability_classifier``.
 _STATS_MODULE = "train_spacy_suitability_classifier"
 TextStats.__module__ = _STATS_MODULE
 sys.modules.setdefault(_STATS_MODULE, sys.modules[__name__])
 
 
 def load_classifier(model_path: str | Path = _DEFAULT_MODEL_OUT) -> Any:
-    """加载本脚本训练并保存的分类器(joblib)。
+    """Load a classifier trained and saved by this script (joblib).
 
-    用法::
+    Usage::
 
         import sys
         sys.path.insert(0, "scripts/utils")
         from train_spacy_suitability_classifier import load_classifier
 
         clf = load_classifier()
-        clf.predict([...])           # 1 = 适合直接用 spacy
+        clf.predict([...])           # 1 = suitable for direct spacy extraction
         clf.predict_proba([...])
     """
     import joblib
@@ -190,7 +199,7 @@ def load_classifier(model_path: str | Path = _DEFAULT_MODEL_OUT) -> Any:
     return joblib.load(model_path)
 
 
-# ── 数据加载 ────────────────────────────────────────────────────────────
+# ── Data loading ────────────────────────────────────────────────────────
 
 def load_passages(
     *,
@@ -199,7 +208,7 @@ def load_passages(
     tempevalrag_path: Path,
     limit_per_dataset: int,
 ) -> list[tuple[str, Document]]:
-    """加载指定数据集的 passage,返回 [(dataset_tag, Document), ...]。"""
+    """Load passages from the specified datasets, returning [(dataset_tag, Document), ...]."""
     out: list[tuple[str, Document]] = []
     if "timeqa" in datasets:
         logger.info("loading TimeQA passages from %s", timeqa_path)
@@ -219,7 +228,7 @@ def load_passages(
     return out
 
 
-# ── 标注缓存 ────────────────────────────────────────────────────────────
+# ── Label cache ─────────────────────────────────────────────────────────
 
 def _text_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
@@ -230,7 +239,7 @@ def _cache_key(dataset: str, source_id: str) -> str:
 
 
 def load_label_cache(cache_path: Path) -> dict[str, dict[str, Any]]:
-    """读回缓存 ``{cache_key: row}``;hash 不一致的陈旧行自动丢弃。"""
+    """Read back the cache ``{cache_key: row}``; stale rows whose hash mismatches are discarded automatically."""
     rows: dict[str, dict[str, Any]] = {}
     if not cache_path.is_file():
         return rows
@@ -246,19 +255,21 @@ def load_label_cache(cache_path: Path) -> dict[str, dict[str, Any]]:
             key = row.get("key")
             if not key:
                 continue
-            # 与当前原文 hash 不一致 → 过期,留给本次重新标注。
+            # Hash differs from the current raw text → stale; leave it for relabeling in this run.
             if row.get("text_hash") != _text_hash(row.get("text", "")):
                 continue
             rows[key] = row
     return rows
 
 
-# ── 阶段 1:标注 ─────────────────────────────────────────────────────────
+# ── Stage 1: labeling ───────────────────────────────────────────────────
 
 def is_spacy_suitable(n_spacy: int, n_llm: int, gap_threshold: int = 0) -> int:
-    """弱监督正样本规则:spacy 不少提,或少提不超过 ``gap_threshold`` 条。
+    """Weakly supervised positive rule: spacy extracts no fewer facts, or no more
+    than ``gap_threshold`` fewer facts.
 
-    返回 1(适合 spacy)/ 0。threshold=0 时等价于 ``n_spacy >= n_llm``。
+    Returns 1 (spacy-suitable) / 0. With threshold=0 it is equivalent to
+    ``n_spacy >= n_llm``.
     """
     return int(n_spacy >= n_llm or (n_llm - n_spacy) <= gap_threshold)
 
@@ -271,13 +282,13 @@ def _build_nugget_llm_extractor(
     llm_timeout: float,
     structured_compat: bool,
 ) -> Any:
-    """构造与基准脚本同口径的 nuggetindex LLM 提取器。
+    """Construct a nuggetindex LLM extractor with the same settings as the benchmark script.
 
-    - ``structured_compat=True``(llama3.2 默认):``OllamaCompatClient``,
-      Ollama json_schema 约束解码 + 输出规范化;
-    - False:nuggetindex 原生 instructor client(qwen3 等强模型);
-    - 外层统一用 ``PlaceholderValidityLLMExtractor``(仅影响 validity,
-      不影响事实数量)。
+    - ``structured_compat=True`` (default for llama3.2): ``OllamaCompatClient``,
+      Ollama json_schema constrained decoding + output normalization;
+    - False: the native nuggetindex instructor client (strong models such as qwen3);
+    - the outer layer is always ``PlaceholderValidityLLMExtractor`` (affects only
+      validity, not the fact count).
     """
     from nuggetindex.extractors import LLMConfig, build_client
     from tcrag.extractors.ni_llm_placeholder import (
@@ -315,7 +326,7 @@ async def label_passages(
     workers: int,
     label_gap_threshold: int = 0,
 ) -> None:
-    """对未命中缓存的 passage 跑两个提取器,增量写入缓存。"""
+    """Run the two extractors on cache-missing passages and incrementally write them into the cache."""
     from tcrag.extractors.spacy_extractor import SpacyFactExtractor
 
     todo: list[tuple[str, Document]] = []
@@ -343,11 +354,11 @@ async def label_passages(
     )
 
     spacy_ext = SpacyFactExtractor(model=spacy_model, max_facts=max_facts)
-    # 提前加载模型,避免多线程下懒加载竞争。
+    # Load the model up front to avoid lazy-loading races across multiple threads.
     spacy_ext._ensure_nlp()
-    # 生产链路:llama3.2 等小模型走
-    # OllamaCompatClient(json_schema 约束解码),并用 PlaceholderValidity
-    # 包装器;计数口径与基准运行完全一致。
+    # Production pipeline: small models such as llama3.2 go through
+    # OllamaCompatClient (json_schema constrained decoding) wrapped by the
+    # PlaceholderValidity wrapper; the fact-count semantics are identical to the benchmark run.
     llm_ext = _build_nugget_llm_extractor(
         llm_model=llm_model,
         llm_host=llm_host,
@@ -394,12 +405,12 @@ async def label_passages(
         async with sem:
             key = _cache_key(dataset, doc.source_id)
             try:
-                # spaCy 解析共享同一模型,保守地串行化(LLM 等待是主要耗时)。
+                # spaCy parsing shares one model, so conservatively serialize it (LLM waiting dominates the runtime).
                 async with spacy_lock:
                     spacy_facts = await spacy_ext.aextract(
                         doc.text, source_id=doc.source_id
                     )
-            except Exception as exc:  # noqa: BLE001 - 单文档失败不影响整批
+            except Exception as exc:  # noqa: BLE001 - a single-document failure must not affect the whole batch
                 state["done"] += 1
                 state["errors"] += 1
                 logger.warning("spacy 标注失败(不写入缓存,下次续跑重试) %s: %r", key, exc)
@@ -410,10 +421,10 @@ async def label_passages(
                     doc.text, source_id=doc.source_id
                 )
             except ValueError as exc:
-                # 与 tcrag LLMExtractor 一致:结构化输出解析失败 → 降级为 0 事实。
+                # Consistent with tcrag LLMExtractor: failure to parse structured output → degrade to 0 facts.
                 logger.warning("LLM 输出无法解析,按 0 事实计 %s: %s", key, exc)
                 results = []
-            except Exception as exc:  # noqa: BLE001 - 截断/连接错误等留待续跑重试
+            except Exception as exc:  # noqa: BLE001 - truncation/connection errors etc. are left for retry on resume
                 state["done"] += 1
                 state["errors"] += 1
                 logger.warning("LLM 标注失败(不写入缓存,下次续跑重试) %s: %r", key, exc)
@@ -467,7 +478,7 @@ async def label_passages(
     )
 
 
-# ── 阶段 2:训练 ─────────────────────────────────────────────────────────
+# ── Stage 2: training ───────────────────────────────────────────────────
 
 def train_from_cache(
     cache: dict[str, dict[str, Any]],
@@ -477,11 +488,12 @@ def train_from_cache(
     random_state: int,
     label_gap_threshold: int = 0,
 ) -> None:
-    """读缓存去重 → 切分 → 训练 LogisticRegression → 评估并保存。
+    """Read the cache, deduplicate → split → train LogisticRegression → evaluate and save.
 
-    标签按当前 ``label_gap_threshold`` 由 ``n_spacy`` / ``n_llm`` 重算,
-    不使用缓存行里写入时的 ``label`` 字段,因此可在不重新标注的情况下
-    用不同 threshold 重训。
+    Labels are recomputed from ``n_spacy`` / ``n_llm`` with the current
+    ``label_gap_threshold`` rather than using the ``label`` field written into
+    each cache row, so retraining with a different threshold requires no
+    relabeling.
     """
     import joblib
     import numpy as np
@@ -492,7 +504,7 @@ def train_from_cache(
     from sklearn.pipeline import FeatureUnion, Pipeline
     from sklearn.preprocessing import StandardScaler
 
-    # 按 text_hash 去重(同一段文本可能跨数据集重复,避免 train/test 泄漏)。
+    # Deduplicate by text_hash (the same passage may repeat across datasets; avoid train/test leakage).
     unique: dict[str, dict[str, Any]] = {}
     for row in cache.values():
         unique.setdefault(row["text_hash"], row)

@@ -1,32 +1,32 @@
-"""LR 路由的 spaCy / LLM 混合抽取构造器(注册名 ``"spacy_llm_hybrid"``)。
+"""LR-routed spaCy / LLM hybrid extraction constructor (registered name ``"spacy_llm_hybrid"``).
 
-每篇文档进入 :meth:`SpacyLLMHybridConstructor.aprocess` 时,先由
-``scripts/utils/train_spacy_suitability_classifier.py`` 训练的
-LogisticRegression 对原文做一次路由推断:
+When each document enters :meth:`SpacyLLMHybridConstructor.aprocess`, the
+LogisticRegression trained by ``scripts/utils/train_spacy_suitability_classifier.py``
+makes one routing inference on the raw text:
 
-  - 模型输出 ``1``(该 passage 适合 spaCy)→ 走本地
+  - The model outputs ``1`` (the passage is suitable for spaCy) → it uses the local
     :class:`tcrag.extractors.spacy_extractor.SpacyFactExtractor`
-    (经 :class:`tcrag.extractors.extractor_wrapper.ExtractorWrapper`
-    适配到 nuggetindex 接口),零 LLM 调用;
-  - 模型输出 ``0`` → 走 store 已配置的 LLM extractor(要求建库配置
-    ``extractor.type: llm``;即 PlaceholderValidity 包装的 nuggetindex
-    LLMExtractor / OllamaCompatClient 链路)。
+    (adapted to the nuggetindex interface via
+    :class:`tcrag.extractors.extractor_wrapper.ExtractorWrapper`), with zero LLM calls;
+  - The model outputs ``0`` → it uses the LLM extractor already configured on the store (the index-build config must
+    set ``extractor.type: llm``; i.e. the nuggetindex LLMExtractor / OllamaCompatClient chain
+    wrapped by PlaceholderValidity).
 
-两支 extractor 均暴露 nuggetindex 的
-``aextract(text, source_id=...) -> list[ExtractionResult]`` 接口,本构造器
-与 :class:`tcrag.constructors.extract_only.ExtractOnlyConstructor` 一样
-只取 ``.nugget``,不做 canonicalize / 时间推断 / 去重 / 冲突消解等后处理。
+Both extractor branches expose the nuggetindex
+``aextract(text, source_id=...) -> list[ExtractionResult]`` interface; like
+:class:`tcrag.constructors.extract_only.ExtractOnlyConstructor`, this constructor
+takes only ``.nugget`` and does no post-processing such as canonicalization / temporal inference / dedup / conflict resolution.
 
-分类器模型用 joblib 序列化,其中自定义特征类 ``TextStats`` 的 pickle 归属
-模块固定为 ``train_spacy_suitability_classifier``(见训练脚本),因此加载
-前需要把 ``scripts/utils`` 加入 ``sys.path`` 并 import 该模块一次,
-:func:`load_suitability_classifier` 已封装此引导。
+The classifier model is serialized with joblib; the pickle owner module of its custom feature class ``TextStats`` is fixed
+to ``train_spacy_suitability_classifier`` (see the training script), so before loading,
+``scripts/utils`` must be added to ``sys.path`` and that module imported once;
+:func:`load_suitability_classifier` already encapsulates this bootstrap.
 
-工厂参数(经 ``JSTRAGSystem(constructor_kwargs=...)`` 透传)::
+Factory parameters (passed through via ``JSTRAGSystem(constructor_kwargs=...)``)::
 
     build_spacy_llm_hybrid_constructor(
         store,
-        classifier_path="models/spacy_suitability_logreg_th6.joblib",  # 默认
+        classifier_path="models/spacy_suitability_logreg_th6.joblib",  # default
         spacy_model="en_core_web_sm",
         spacy_max_facts=20,
     )
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 logger = get_logger("constructors.spacy_llm_hybrid")
 
 # tcrag/constructors/<file>.py: parents[0]=constructors, parents[1]=tcrag,
-# parents[2]=仓库根。
+# parents[2]=repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CLASSIFIER = (
     _REPO_ROOT / "models" / "spacy_suitability_logreg_th6.joblib"
@@ -63,11 +63,11 @@ _TRAIN_UTILS_DIR = _REPO_ROOT / "scripts" / "utils"
 
 
 def load_suitability_classifier(model_path: str | Path) -> Any:
-    """加载 spaCy 适用性 LR 模型(joblib),并完成 pickle 反序列化引导。
+    """Load the spaCy suitability LR model (joblib) and complete the pickle deserialization bootstrap.
 
-    模型 pipeline 内含训练脚本定义的自定义特征类 ``TextStats``,其 pickle
-    归属模块为 ``train_spacy_suitability_classifier``;import 该训练模块时
-    它会自行把模块对象注册进 ``sys.modules``,joblib 据此还原类。
+    The model pipeline contains the custom feature class ``TextStats`` defined by the training script; its pickle
+    owner module is ``train_spacy_suitability_classifier``; when that training module is imported,
+    it registers its module object into ``sys.modules`` itself, and joblib restores the class based on that.
     """
     import joblib
 
@@ -78,8 +78,8 @@ def load_suitability_classifier(model_path: str | Path) -> Any:
     utils_dir = str(_TRAIN_UTILS_DIR)
     if utils_dir not in sys.path:
         sys.path.insert(0, utils_dir)
-    # import 副作用:训练脚本执行 sys.modules.setdefault(
-    # "train_spacy_suitability_classifier", ...),使 joblib 能解析 TextStats。
+    # Import side effect: the training script executes sys.modules.setdefault(
+    # "train_spacy_suitability_classifier", ...), enabling joblib to resolve TextStats.
     importlib.import_module("train_spacy_suitability_classifier")
 
     model = joblib.load(model_path)
@@ -88,7 +88,7 @@ def load_suitability_classifier(model_path: str | Path) -> Any:
 
 
 class SpacyLLMHybridConstructor(BaseDocumentConstructor):
-    """按 LR 路由在 spaCy / LLM 两个 extractor 间二选一的构造器。"""
+    """Constructor that picks one of the two extractors (spaCy / LLM) according to LR routing."""
 
     def __init__(
         self,
@@ -110,13 +110,13 @@ class SpacyLLMHybridConstructor(BaseDocumentConstructor):
         self._llm_accepts_source_id = accepts_source_id(llm_extractor)
         self._spacy_accepts_source_id = accepts_source_id(spacy_extractor)
 
-        # 路由计数,便于建库后核对 LLM 调用节省比例。
+        # Routing counters, to verify the proportion of LLM calls saved after index construction.
         self._n_spacy = 0
         self._n_llm = 0
         self._n_total = 0
 
     def _route(self, text: str) -> int:
-        """阻塞式 LR 推断;返回 1=spaCy,0=LLM(仅在线程池中调用)。"""
+        """Blocking LR inference; returns 1=spaCy, 0=LLM (called only inside the thread pool)."""
         pred = self._classifier.predict([text])
         return int(pred[0])
 
@@ -128,7 +128,7 @@ class SpacyLLMHybridConstructor(BaseDocumentConstructor):
         fetch_existing_by_key: FetchExistingByKey | None = None,
         alias_resolver: AliasResolver | None = None,
     ) -> list[Nugget]:
-        # sklearn 推断是 CPU 阻塞调用,丢线程池避免卡住事件循环。
+        # sklearn inference is a blocking CPU call; offload it to the thread pool to avoid blocking the event loop.
         use_spacy = await asyncio.to_thread(self._route, doc.text)
 
         if use_spacy == 1:
@@ -175,18 +175,18 @@ def build_spacy_llm_hybrid_constructor(
     spacy_model: str = "en_core_web_sm",
     spacy_max_facts: int = 20,
 ) -> SpacyLLMHybridConstructor:
-    """从 store 装配混合构造器。
+    """Assemble the hybrid constructor from the store.
 
     Args:
-        store: 已配置 LLM extractor 的 ``NuggetStore``(建库 YAML 需为
-            ``extractor.type: llm``);``store._extractor`` 作为 LLM 分支。
-        classifier_path: LR 模型 joblib 路径,默认
-            ``models/spacy_suitability_logreg_th6.joblib``。
-        spacy_model: spaCy 分支使用的模型名。
-        spacy_max_facts: spaCy 分支每篇文档的事实上限。
+        store: A ``NuggetStore`` configured with an LLM extractor (the index-build YAML must set
+            ``extractor.type: llm``); ``store._extractor`` serves as the LLM branch.
+        classifier_path: Path to the LR model joblib, defaulting to
+            ``models/spacy_suitability_logreg_th6.joblib``.
+        spacy_model: Model name used by the spaCy branch.
+        spacy_max_facts: Upper bound of facts per document for the spaCy branch.
 
     Raises:
-        RuntimeError: store 未配置 extractor,或分类器模型文件不存在。
+        RuntimeError: The store has no extractor configured, or the classifier model file does not exist.
     """
     llm_extractor = getattr(store, "_extractor", None)
     if llm_extractor is None:
@@ -202,8 +202,8 @@ def build_spacy_llm_hybrid_constructor(
     spacy_extractor = ExtractorWrapper(
         SpacyFactExtractor(model=spacy_model, max_facts=spacy_max_facts)
     )
-    # 提前加载 spaCy 模型,与标注脚本同口径:首篇文档并发时避免懒加载竞争,
-    # 也让模型缺失在建库开始时就快速失败。
+    # Eagerly load the spaCy model, consistent with the annotation script: avoid lazy-loading races when the first
+    # documents arrive concurrently, and also fail fast at the start of index construction if the model is missing.
     spacy_extractor._extractor._ensure_nlp()
 
     clf_path = Path(classifier_path) if classifier_path else _DEFAULT_CLASSIFIER

@@ -1,44 +1,50 @@
-"""单独生成训练数据文件:逐 passage 标注来源 + spacy/llm 事实数量。
+"""Generate the training data file separately: label each passage's source and
+spacy/llm fact counts.
 
-本脚本**只做数据生成、不训练模型**。它复用同目录的
+This script **only generates data and does not train a model**. It reuses the
+existing loading and labeling logic from
 [train_spacy_suitability_classifier.py](file:///home/cxy/TCRag/scripts/utils/train_spacy_suitability_classifier.py)
-中已有的加载与标注逻辑,产出与该脚本标注缓存**完全同格式**的 JSONL,
-因此生成的文件可被其直接复用(``--no-label --label-cache <输出文件>``)。
+in the same directory and produces JSONL in **exactly the same format** as that
+script's label cache, so the generated file can be consumed directly by it
+(``--no-label --label-cache <output file>``).
 
-输出文件每行一个 JSON::
+The output file contains one JSON object per line::
 
     {
       "key": "timeqa:timeqa_/wiki/Ian_Gibson_(politician)_1",
-      "dataset": "timeqa",                  # 来源数据集
-      "source_id": "timeqa_/wiki/...",      # passage 来源标识
+      "dataset": "timeqa",                  # source dataset
+      "source_id": "timeqa_/wiki/...",      # passage source identifier
       "text_hash": "719690932cafee69",
-      "n_spacy": 1,                         # spacy 提取的事实数量
-      "n_llm": 6,                           # llm 提取的事实数量
-      "label": 0,                           # n_spacy >= n_llm → 1, 否则 0
-      "text": "Ian Gibson ( ... ) ..."       # passage 原文
+      "n_spacy": 1,                         # number of facts extracted by spacy
+      "n_llm": 6,                           # number of facts extracted by llm
+      "label": 0,                           # n_spacy >= n_llm → 1, otherwise 0
+      "text": "Ian Gibson ( ... ) ..."       # raw passage text
     }
 
-特性
-====
+Features
+========
 
-- 默认输出到分类器的默认缓存路径 ``data/spacy_suitability_labels.jsonl``,
-  生成后直接 ``--no-label`` 即可训练,无需指定路径;
-- **增量续跑**:已在输出文件中且 text_hash 一致的 passage 自动跳过,
-  中断后可反复运行;标注失败的 passage 不写入,下次自动重试;
-- 结束后打印各数据集的 passage 数与 spacy/llm 计数汇总。
+- Outputs by default to the classifier's default cache path
+  ``data/spacy_suitability_labels.jsonl``; after generation, train directly with
+  ``--no-label``, no path specification needed;
+- **Incremental resume**: passages already in the output file with a matching
+  text_hash are skipped automatically, so it can be run repeatedly after
+  interruptions; passages that fail labeling are not written and are retried
+  automatically next time;
+- prints the per-dataset passage counts and a summary of spacy/llm counts at the end.
 
-运行(需在 tcrag conda 环境内、ollama 已启动)::
+Running (inside the tcrag conda environment, with ollama started)::
 
     conda activate tcrag
 
-    # 小规模试跑
+    # Small trial run
     python scripts/utils/generate_spacy_suitability_data.py \
         --limit-per-dataset 100 --workers 3
 
-    # 全量生成(TimeQA dev + TempEvalRAG;可多次中断续跑)
+    # Full generation (TimeQA dev + TempEvalRAG; can be interrupted and resumed repeatedly)
     python scripts/utils/generate_spacy_suitability_data.py
 
-    # 生成后直接复用训练
+    # Reuse directly for training after generation
     python scripts/utils/train_spacy_suitability_classifier.py --no-label
 """
 
@@ -51,17 +57,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# 直接以 ``python scripts/utils/xxx.py`` 运行时,仓库根目录不在 sys.path 中。
-# scripts/utils/<file>.py: parents[0]=utils, parents[1]=scripts, parents[2]=仓库根。
+# When run directly as ``python scripts/utils/xxx.py``, the repository root is not on sys.path.
+# scripts/utils/<file>.py: parents[0]=utils, parents[1]=scripts, parents[2]=repository root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-# 复用同目录分类器脚本中的标注实现(避免重复维护两份逻辑)。
+# Reuse the labeling implementation from the classifier script in the same directory (avoid maintaining two copies of the logic).
 _UTILS_DIR = Path(__file__).resolve().parent
 if str(_UTILS_DIR) not in sys.path:
     sys.path.insert(0, str(_UTILS_DIR))
 
-# 本地 Ollama 服务不走系统代理(VPN/代理环境下否则会拦截 localhost 请求)。
+# The local Ollama service must bypass the system proxy (otherwise VPN/proxy setups intercept localhost requests).
 os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
 
@@ -78,10 +84,10 @@ from train_spacy_suitability_classifier import (
 logger = get_logger("generate_spacy_data")
 
 
-# ── 汇总报告 ────────────────────────────────────────────────────────────
+# ── Summary report ──────────────────────────────────────────────────────
 
 def summarize(cache: dict[str, dict[str, Any]]) -> None:
-    """按数据集汇总 passage 数与 spacy/llm 事实计数。"""
+    """Summarize passage counts and spacy/llm fact counts by dataset."""
     groups: dict[str, dict[str, Any]] = {}
     for row in cache.values():
         dataset = str(row.get("dataset", "unknown"))
@@ -208,7 +214,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     )
 
-    # 重新从文件读回,保证汇总基于实际落盘内容。
+    # Re-read from the file to ensure the summary is based on the actual on-disk content.
     summarize(load_label_cache(args.output))
     logger.info(
         "训练数据已就绪,可直接训练:"

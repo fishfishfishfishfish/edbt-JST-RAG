@@ -1,23 +1,23 @@
-"""可插拔 ``DocumentConstructor`` 实现注册表。
+"""Registry of pluggable ``DocumentConstructor`` implementations.
 
-RAG 系统(见
+Before its first ingestion, the RAG system (see
 :class:`tcrag.rag_systems.jst_system.JSTRAGSystem`)
-在首次入库前通过 :func:`build_constructor` 把所选实现安装到
-``NuggetStore._constructor``。``spec`` 支持三种形式:
+installs the selected implementation onto ``NuggetStore._constructor`` via :func:`build_constructor`.
+``spec`` supports three forms:
 
-  - ``None``:不注入,沿用 nuggetindex 自身的懒建原生构造器;
-  - ``str``:查本表内置注册名(``"spacy_llm_hybrid"``);
-  - ``callable``:直接作为 ``factory(store, **kwargs)`` 调用,便于在
-    benchmark 脚本里用 ``lambda store: ...`` / ``functools.partial``
-    传参,风格与 ``retriever_factory(store)`` 保持一致。
+  - ``None``: do not inject; keep nuggetindex's own lazily-built native constructor;
+  - ``str``: look up a built-in registered name in this table (``"spacy_llm_hybrid"``);
+  - ``callable``: invoked directly as ``factory(store, **kwargs)``, convenient for passing parameters in
+    benchmark scripts with ``lambda store: ...`` / ``functools.partial``,
+    keeping a style consistent with ``retriever_factory(store)``.
 
-新增一种构造器实现只需:
+Adding a new constructor implementation requires only:
 
-  1. 在本目录新增模块,继承
-     :class:`tcrag.constructors.base.BaseDocumentConstructor` 实现
-     ``aprocess``,并提供 ``factory(store) -> constructor``;
-  2. 用 :func:`register_constructor` 注册(或直接写入
-     :data:`CONSTRUCTOR_REGISTRY`),之后即可按名称引用。
+  1. Add a module in this directory that inherits from
+     :class:`tcrag.constructors.base.BaseDocumentConstructor`, implements
+     ``aprocess``, and provides ``factory(store) -> constructor``;
+  2. Register it with :func:`register_constructor` (or write it directly into
+     :data:`CONSTRUCTOR_REGISTRY`), after which it can be referenced by name.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ CONSTRUCTOR_REGISTRY: dict[str, ConstructorFactory] = {}
 
 
 def register_constructor(name: str) -> Callable[[ConstructorFactory], ConstructorFactory]:
-    """装饰器:把 ``factory(store, **kwargs)`` 以 ``name`` 登记进注册表。"""
+    """Decorator: register ``factory(store, **kwargs)`` into the registry under ``name``."""
 
     def _decorator(factory: ConstructorFactory) -> ConstructorFactory:
         CONSTRUCTOR_REGISTRY[name] = factory
@@ -57,9 +57,9 @@ def register_constructor(name: str) -> Callable[[ConstructorFactory], Constructo
     return _decorator
 
 
-# 必须在注册表与装饰器定义之后再导入实现模块:子模块顶部的
-# @register_constructor 在导入时把自己登记进已存在的注册表(顺序反过来会
-# 命中半初始化的包,产生循环导入错误)。
+# Implementation modules must be imported only after the registry and decorator are defined: the
+# @register_constructor at the top of a submodule registers itself into the already-existing registry on import (reversing the order would
+# hit a half-initialized package and cause a circular-import error).
 from tcrag.constructors.spacy_llm_hybrid import (  # noqa: E402
     SpacyLLMHybridConstructor,
     build_spacy_llm_hybrid_constructor,

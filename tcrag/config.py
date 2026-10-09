@@ -29,9 +29,10 @@ class LLMConfig:
     timeout: int = 120
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "llama3.1"
-    # 仅 provider=ollama 且小模型结构化输出不稳定时开启(如 llama3.2):
-    # 使用 OllamaCompatClient(json_schema constrained decoding + 输出规范化)。
-    # qwen3 等强模型保持 False,走 nuggetindex 原生 instructor client。
+    # Enable only when provider=ollama and a small model's structured output is
+    # unstable (e.g. llama3.2): uses OllamaCompatClient (json_schema constrained
+    # decoding + output normalization). Strong models like qwen3 stay False and
+    # use nuggetindex's native instructor client.
     structured_compat: bool = False
 
 
@@ -47,7 +48,7 @@ class ExtractorConfig:
 @dataclass
 class RAGConfig:
     top_k: int = 10
-    # 实际用于构造 LLM 上下文的段落数;None 时等于 top_k
+    # Number of passages actually used to build the LLM context; equals top_k when None.
     ctx_top_k: int | None = None
     context_token_budget: int = 3000
     fusion: str = "rrf"
@@ -57,18 +58,20 @@ class RAGConfig:
 class NuggetIndexConfig:
     enabled: bool = True
     db_path: str = "data/nuggetindex.db"
-    # 可导入路径 "module:attr" 或 "module.attr";为空时使用 nuggetindex 原生
-    # Retriever。callable 签名: (store: NuggetStore) -> Any,返回的对象必须实现
-    # async aretrieve(query, *, query_time, view, top_k, fusion, filters)。
+    # Importable path "module:attr" or "module.attr"; when empty, nuggetindex's
+    # native Retriever is used. Callable signature: (store: NuggetStore) -> Any;
+    # the returned object must implement
+    # async aretrieve(query, *, query_time, view, top_k, fusion, filters).
     retriever_factory: str | None = None
-    # DocumentConstructor 构造器注册名(见 tcrag.constructors 注册表):
-    # "native"(原生四阶段)/ "extract_only"(仅抽取)/ "sentence"(按句成行);
-    # 仅 JSTRAGSystem 消费此项。
-    # 留空时按入口默认处理。
+    # Registered name of the DocumentConstructor builder (see the tcrag.constructors
+    # registry): "native" (native four stages) / "extract_only" (extraction only) /
+    # "sentence" (one line per sentence); only JSTRAGSystem consumes this option.
+    # When left empty, the entry-point default applies.
     constructor_factory: str | None = None
-    # 报告中使用的系统名(BaseRAGSystem.name):同一份系统代码跑不同构造器 /
-    # 检索器变体时,靠它在报告里区分(如 nuggetindex_extract_only)。
-    # 留空时各入口回退到自身默认名。
+    # System name used in reports (BaseRAGSystem.name): when the same system code
+    # runs different constructor/retriever variants, this distinguishes them in
+    # reports (e.g. nuggetindex_extract_only). When empty, each entry point falls
+    # back to its own default name.
     report_name: str | None = None
 
 
@@ -80,47 +83,63 @@ class GraphitiConfig:
     neo4j_password: str = "password"
     group_id: str | None = None
     max_coroutines: int | None = None
-    # graphiti 原生 LLM 链路使用的 embedding 模型;留空则按 llm.provider 默认:
-    # openai -> text-embedding-3-small;ollama -> bge-m3(需先 ollama pull bge-m3)
+    # Embedding model used by graphiti's native LLM pipeline; when empty it
+    # defaults according to llm.provider: openai -> text-embedding-3-small;
+    # ollama -> bge-m3 (requires `ollama pull bge-m3` first)
     embedding_model: str = ""
-    # ollama 链路 graphiti 专用的模型名覆盖;留空则沿用 llm.ollama_model。
-    # 用途:ollama 默认 num_ctx=4096,而 graphiti 结构化抽取请求 max_tokens=16384,
-    # /v1 端点又不接受 per-request options,长 JSON 会在 4096 上下文墙处被截断。
-    # 需指向一个带大 num_ctx 的派生模型(由 scripts 预检自动创建),如 qwen3.8-ctx32k。
+    # Dedicated model-name override for graphiti on the ollama pipeline; when
+    # empty it inherits llm.ollama_model. Rationale: ollama's default
+    # num_ctx=4096, while graphiti structured-extraction requests use
+    # max_tokens=16384 and the /v1 endpoint does not accept per-request
+    # options, so long JSON gets truncated at the 4096-context wall. It must
+    # point to a derived model with a large num_ctx (auto-created by the scripts
+    # preflight check), e.g. qwen3.8-ctx32k.
     ollama_model: str = ""
-    # ollama 链路下发给 /v1 chat.completions 的 max_tokens(覆盖 graphiti 默认 16384)。
-    # graphiti 实体/边抽取的长 JSON 在 16384 tokens 处被硬截断会导致 JSONDecodeError;
-    # 值需 < 派生模型的 num_ctx(默认 32768)并给 prompt 留余量。
+    # max_tokens sent to /v1 chat.completions on the ollama pipeline (overrides
+    # graphiti's default of 16384). The long JSON from graphiti entity/edge
+    # extraction hard-truncated at 16384 tokens causes JSONDecodeError; the
+    # value must be below the derived model's num_ctx (default 32768) while
+    # leaving headroom for the prompt.
     ollama_max_tokens: int = 28000
-    # llama3.2 等小模型在 graphiti 复杂 schema 下会确定性地产出非法 JSON
-    # (同一 episode 4 次重试报同一 char 位置),重试纯属浪费时间(每次 ~6min
-    # × 4 + 退避 ≈ 25min/episode)。开启后 monkey-patch graphiti 的
-    # is_server_or_retry_error,对 JSONDecodeError 不重试,失败直接抛出,
-    # 将最坏情况从 ~10h 降到 ~2.5h。其他可恢复错误(RateLimit / 5xx)仍重试。
+    # Small models such as llama3.2 deterministically produce invalid JSON
+    # under graphiti's complex schema (all 4 retries for the same episode fail
+    # at the same char position), so retries are pure waste (~6 min each x 4
+    # plus backoff ~= 25 min/episode). When enabled, monkey-patches graphiti's
+    # is_server_or_retry_error so JSONDecodeError is not retried: failures are
+    # raised immediately, cutting the worst case from ~10h to ~2.5h. Other
+    # recoverable errors (RateLimit / 5xx) are still retried.
     ollama_no_retry_json_error: bool = False
-    # 切换 aingest_documents 到 add_episode_bulk 路径:批量并行抽取 + 跨
-    # episode 内存去重 + 批量 Neo4j 写入。对 Ollama 单槽模型真实并行度
-    # 受限于 OLLAMA_NUM_PARALLEL(默认 1);但对多 episode 跨实体去重和
-    # DB 往返仍有收益。失败时整批回退到单条 add_episode。
+    # Switches aingest_documents to the add_episode_bulk path: batch parallel
+    # extraction + cross-episode in-memory deduplication + batched Neo4j
+    # writes. For Ollama single-slot models the real parallelism is limited by
+    # OLLAMA_NUM_PARALLEL (default 1), but it still helps with cross-entity
+    # deduplication across multiple episodes and DB round-trips. On failure
+    # the whole batch falls back to one-by-one add_episode.
     use_bulk_ingest: bool = False
-    # bulk 每批 episode 数。bulk_utils 内部 CHUNK_SIZE=10,建议 ≤10。
-    # LLM 不稳定(llama3.2 JSON 失败率高)时调小到 5,失败损失更小。
+    # Number of episodes per bulk batch. bulk_utils uses an internal
+    # CHUNK_SIZE=10, so a value <= 10 is recommended. When the LLM is unstable
+    # (llama3.2 has a high JSON failure rate), reduce it to 5 so a failure
+    # costs less.
     bulk_chunk_size: int = 10
-    # monkey-patch graphiti_core.graphiti.extract_nodes_and_edges_bulk 强制
-    # use_combined_extraction=True:节点+边合并为单次 LLM 调用,抽取阶段
-    # LLM 调用数减半。stub 模式下 make_stub_openai 已支持 CombinedExtraction
-    # 模型。与 use_bulk_ingest 配合使用最佳,但也可独立启用(只影响 bulk
-    # 内部节点/边抽取链路)。
+    # Monkey-patches graphiti_core.graphiti.extract_nodes_and_edges_bulk to
+    # force use_combined_extraction=True: nodes and edges are merged into a
+    # single LLM call, halving the number of LLM calls during extraction. In
+    # stub mode make_stub_openai already supports the CombinedExtraction
+    # model. Works best together with use_bulk_ingest, but can also be enabled
+    # independently (it only affects the node/edge extraction chain inside
+    # bulk).
     use_combined_extraction: bool = False
 
 
 @dataclass
 class SQLiteFaissConfig:
-    """SQLite(FTS5)+ FAISS 时序检索对比系统配置。
+    """Configuration for the SQLite (FTS5) + FAISS temporal-retrieval comparison systems.
 
-    两个对比系统(``timefilter`` 硬时间过滤 + BM25/向量融合;
-    ``distproduct`` 向量距离 × 时间距离乘积)共享同一存储底座,仅检索
-    策略不同。``db_dir`` 下按系统名生成各自的 ``<name>.db`` 文件。
+    The two comparison systems (``timefilter``: hard time filtering plus
+    BM25/vector fusion; ``distproduct``: product of vector distance and
+    temporal distance) share the same storage backend and differ only in
+    retrieval strategy. Separate ``<name>.db`` files are created per system
+    name under ``db_dir``.
     """
 
     enabled: bool = True
@@ -133,7 +152,7 @@ class SQLiteFaissConfig:
 
 @dataclass
 class BM25DocConfig:
-    """纯文档级 BM25 基线配置(SQLite FTS5,不做 nugget 抽取)。"""
+    """Configuration for the document-level-only BM25 baseline (SQLite FTS5, no nugget extraction)."""
 
     enabled: bool = True
     db_path: str = "data/bm25_doc.db"
@@ -141,33 +160,38 @@ class BM25DocConfig:
 
 @dataclass
 class ContrieverConfig:
-    """Contriever 稠密检索基线配置(FAISS ``IndexFlatIP`` 落盘向量索引)。
+    """Configuration for the Contriever dense-retrieval baseline (on-disk FAISS ``IndexFlatIP`` vector index).
 
-    与 :class:`BM25DocConfig` 一一对应,doc / sentence 两种粒度共用本配置;
-    句子级粒度的默认索引路径由基准入口按 ``db_path`` 派生
-    (文件名中的 ``_doc`` 替换为 ``_sentence``),也可用命令行 ``--db-path``
-    显式覆盖。``db_path`` 指 ``.faiss`` 向量索引,同 stem 的
-    ``.meta.jsonl`` 为元数据 sidecar。编码器为 ``facebook/contriever``
-    (transformers + torch,mean pooling + L2 normalize,768 维)。
+    Mirrors :class:`BM25DocConfig` one-to-one; both doc and sentence
+    granularities share this configuration. The default index path for the
+    sentence-level granularity is derived from ``db_path`` by the benchmark
+    entry point (``_doc`` in the file name is replaced with ``_sentence``),
+    and can also be overridden explicitly via the command-line ``--db-path``.
+    ``db_path`` points to the ``.faiss`` vector index; the same-stem
+    ``.meta.jsonl`` is the metadata sidecar. The encoder is
+    ``facebook/contriever`` (transformers + torch, mean pooling plus L2
+    normalization, 768 dimensions).
     """
 
     enabled: bool = True
     db_path: str = "data/contriever_doc.faiss"
     model_name: str = "facebook/contriever"
-    # 编码设备:auto(实测 GPU 可算则用,否则回退 CPU)/cuda/cuda:0/cpu
+    # Encoding device: auto (use GPU if it actually works, otherwise fall back
+    # to CPU) / cuda / cuda:0 / cpu
     device: str = "auto"
-    # GPU 上是否使用 fp16 半精度(V100 等可显著提速);CPU 时忽略
+    # Whether to use fp16 half precision on GPU (significantly speeds up V100
+    # etc.); ignored on CPU
     fp16: bool = True
-    # ingest 编码批大小(GPU/内存允许时可调大)
+    # Encoding batch size for ingestion (can be increased when GPU/memory allow)
     encode_batch_size: int = 32
 
 
 @dataclass
 class RagasConfig:
-    """ragas 评估指标配置(judge LLM + embeddings)。
+    """Configuration for ragas evaluation metrics (judge LLM + embeddings).
 
-    judge_llm_model 为空时回退到主 LLMConfig.model。
-    embedding_provider 支持未来扩展(如 "huggingface")。
+    Falls back to the main LLMConfig.model when judge_llm_model is empty.
+    embedding_provider is reserved for future extensions (e.g. "huggingface").
     """
 
     enabled: bool = False

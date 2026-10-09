@@ -1,21 +1,21 @@
-"""nuggetindex 侧 LLMExtractor 子类:用 placeholder validity 替换 now()。
+"""nuggetindex-side LLMExtractor subclass: replace now() with placeholder validity.
 
-nuggetindex 原生 :class:`LLMExtractor` 在 :meth:`aextract` 里用
-``ValidityInterval(start=datetime.now(UTC))`` 作为 nugget 的初始 validity
-(见 ``nuggetindex/extractors/llm.py`` L144)。这会导致:
+nuggetindex's native :class:`LLMExtractor` uses
+``ValidityInterval(start=datetime.now(UTC))`` inside :meth:`aextract` as the nugget's initial validity
+(see ``nuggetindex/extractors/llm.py`` L144). This leads to:
 
-1. ``is_placeholder()`` 返回 False(``source_type="document"`` 而非 ``"placeholder"``)
-2. :class:`DocumentConstructor` 的 temporal stage 把该 validity 作为 ``prior``,
-   不会用 ``source_date`` 重新推理
-3. 当 document 没有显式 ``reference_time`` 时,validity_start 落到 ingestion 时刻,
-   早于该时刻的查询(如 TimeQA 的历史时间)会把 nugget 全部过滤掉
+1. ``is_placeholder()`` returns False (``source_type="document"`` rather than ``"placeholder"``)
+2. The temporal stage of :class:`DocumentConstructor` treats that validity as the ``prior``,
+   and does not re-infer it using ``source_date``
+3. When the document has no explicit ``reference_time``, validity_start falls on the ingestion time,
+   and queries earlier than that time (e.g. historical times in TimeQA) filter out every nugget
 
-本子类 override :meth:`aextract`,把每个 nugget 的 validity 替换为
-``ValidityInterval.unknown()``(``start=0001-01-01, source_type="placeholder"``),
-让 temporal stage 用 ``source_date`` 重新推理。文本含真实时间线索时用真实时间,
-无线索时用 ``source_date`` 兜底。
+This subclass overrides :meth:`aextract`, replacing each nugget's validity with
+``ValidityInterval.unknown()`` (``start=0001-01-01, source_type="placeholder"``),
+so the temporal stage re-infers using ``source_date``. When the text contains real temporal clues, the real time is used;
+when there are no clues, ``source_date`` is used as the fallback.
 
-用法(替代 ``nuggetindex.extractors.LLMExtractor``)::
+Usage (replaces ``nuggetindex.extractors.LLMExtractor``)::
 
     from tcrag.extractors.ni_llm_placeholder import PlaceholderValidityLLMExtractor
     extractor = PlaceholderValidityLLMExtractor(ni_cfg, client=build_client(ni_cfg))
@@ -31,12 +31,12 @@ __all__ = ["PlaceholderValidityLLMExtractor"]
 
 
 class PlaceholderValidityLLMExtractor(NiLLMExtractor):
-    """LLMExtractor 子类:把 nugget validity 替换为 ``unknown()``。
+    """LLMExtractor subclass: replace nugget validity with ``unknown()``.
 
-    继承 nuggetindex 原生 :class:`LLMExtractor`,仅在 :meth:`aextract`
-    返回前把每个 ``ExtractionResult.nugget`` 重建为
-    ``validity=ValidityInterval.unknown()``,触发 temporal stage 用
-    ``source_date`` 重新推理。
+    Inherits from nuggetindex's native :class:`LLMExtractor`; just before :meth:`aextract`
+    returns, each ``ExtractionResult.nugget`` is rebuilt with
+    ``validity=ValidityInterval.unknown()``, triggering the temporal stage to re-infer using
+    ``source_date``.
     """
 
     async def aextract(
@@ -50,9 +50,9 @@ class PlaceholderValidityLLMExtractor(NiLLMExtractor):
         out: list[ExtractionResult] = []
         for r in results:
             old = r.nugget
-            # 用 unknown() 替换 now():source_type="placeholder" 让
-            # constructor.py 的 ``is_placeholder()`` 返回 True,
-            # 从而 ``prior = None``,temporal stage 用 source_date 重新推理。
+            # Replace now() with unknown(): source_type="placeholder" makes
+            # the ``is_placeholder()`` in constructor.py return True,
+            # so that ``prior = None`` and the temporal stage re-infers using source_date.
             new_nugget = Nugget.new(
                 kind=old.kind,
                 fact=old.fact,

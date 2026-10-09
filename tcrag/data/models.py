@@ -78,9 +78,10 @@ class QAResult:
     retrieved: list[RetrievalHit] = field(default_factory=list)
     context: str = ""
     latency_seconds: float = 0.0
-    # 分段耗时:retrieval_latency_seconds 仅检索,llm_latency_seconds 仅
-    # LLM 生成(含 context 拼装,该部分开销很小)。两者之和 ≤ latency_seconds
-    # (总 wall-clock)。
+    # Per-stage timings: retrieval_latency_seconds covers retrieval only,
+    # llm_latency_seconds covers LLM generation only (including context
+    # assembly, whose overhead is negligible). Their sum is <=
+    # latency_seconds (the total wall-clock time).
     retrieval_latency_seconds: float = 0.0
     llm_latency_seconds: float = 0.0
     prompt_tokens: int = 0

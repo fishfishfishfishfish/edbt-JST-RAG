@@ -37,7 +37,7 @@ class QueryResult:
     retrieved_doc_ids: list[str]
     answer: str
     latency_seconds: float
-    # 分段耗时:retrieval 为纯检索,llm 为纯生成(--no-qa 模式下为 0.0)。
+    # Stage-wise timings: retrieval is pure retrieval, llm is pure generation (0.0 in --no-qa mode).
     retrieval_latency_seconds: float = 0.0
     llm_latency_seconds: float = 0.0
     retrieval_metrics: dict[str, float] = field(default_factory=dict)
@@ -54,12 +54,13 @@ class SystemReport:
     performance: dict[str, float] = field(default_factory=dict)
     per_query: list[QueryResult] = field(default_factory=list)
     ragas: dict[str, float] = field(default_factory=dict)
-    # 存储占用(字节):输入数据文件大小与落盘索引大小,由基准入口脚本填充。
-    # 约定键:dataset_file/dataset_bytes、queries_file/queries_bytes、
-    # index_path/index_bytes。
+    # Storage usage in bytes: sizes of the input data files and the on-disk index, populated by the benchmark entry script.
+    # Conventional keys: dataset_file/dataset_bytes, queries_file/queries_bytes,
+    # index_path/index_bytes.
     storage: dict[str, Any] = field(default_factory=dict)
-    # 运行参数与关键配置快照(CLI args + cfg 摘要),由基准入口脚本填充,
-    # reporter 写入 md 报告顶部 "Run Configuration" 小节,便于复现。
+    # Snapshot of run arguments and key configuration (CLI args + cfg summary), populated by the
+    # benchmark entry script; the reporter writes it into the "Run Configuration" section at the
+    # top of the Markdown report for reproducibility.
     run_meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,11 +76,11 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 class _RagasScorerSet:
-    """懒构建并缓存 ragas 评判 scorers,实现三级降级。
+    """Lazily build and cache the ragas judge scorers, implementing a three-level fallback.
 
-    - ragas 未安装 → available=False,跳过全部 ragas 指标
-    - 已安装但无 OPENAI_API_KEY → llm_ready=False,仅运行 RougeScore/BleuScore
-    - 已安装 + 有 key → 全部运行
+    - ragas not installed -> available=False, skip all ragas metrics
+    - Installed but no OPENAI_API_KEY -> llm_ready=False, run only RougeScore/BleuScore
+    - Installed and the key is present -> run everything
     """
 
     def __init__(self, ragas_cfg: RagasConfig, llm_cfg: LLMConfig) -> None:
@@ -106,7 +107,7 @@ class _RagasScorerSet:
             return False
 
     async def _ensure_llm(self) -> None:
-        """懒构建 AsyncOpenAI client + llm_factory + embedding_factory。"""
+        """Lazily build the AsyncOpenAI client plus llm_factory and embedding_factory."""
         if self._llm is not None:
             return
         from openai import AsyncOpenAI
@@ -135,7 +136,7 @@ class _RagasScorerSet:
         self.llm_ready = True
 
     async def get_scorers(self) -> dict[str, Any]:
-        """返回 {metric_name: scorer} 字典,按 config 开关过滤。"""
+        """Return a {metric_name: scorer} dict, filtered according to the config toggles."""
         if not self.available:
             return {}
         if self._scorers:
@@ -231,9 +232,9 @@ class Evaluator:
         f1_scores: list[float] = []
         recall_scores: list[float] = []
 
-        # 评估进度日志:每 eval_log_interval_queries 个 query 或至少间隔
-        # eval_log_interval_seconds 秒打一次,避免长批次(含 LLM 问答,单 query
-        # 可达数秒)运行时无任何输出。
+        # Evaluation progress logging: emit a log entry every eval_log_interval_queries queries or at
+        # least every eval_log_interval_seconds, to avoid a complete lack of output during long runs
+        # (with LLM QA, a single query can take several seconds).
         eval_log_interval_queries = 20
         eval_log_interval_seconds = 120.0
         eval_start = time.perf_counter()
@@ -252,12 +253,12 @@ class Evaluator:
                 hits = await system.aretrieve(q.text, top_k=top_k, reference_time=q.reference_time)
                 retrieved_ids = [h.doc_id for h in hits]
                 answer = ""
-                # --no-qa:无 LLM 阶段,总耗时即检索耗时(下方统一赋值)
+                # --no-qa: there is no LLM stage, so the total latency is the retrieval latency (assigned uniformly below)
                 retrieval_lat = 0.0
                 llm_lat = 0.0
             latency = time.perf_counter() - t0
             latencies.append(latency)
-            # retrieval-only 模式下总耗时即检索耗时;pipeline 模式用分段计时。
+            # In retrieval-only mode the total latency equals the retrieval latency; in pipeline mode the staged timings are used.
             retrieval_latencies.append(
                 retrieval_lat if pipeline is not None else latency
             )
@@ -285,7 +286,7 @@ class Evaluator:
                 f1_scores.append(f1)
                 recall_scores.append(ar)
 
-            # --- ragas 指标(context recall/precision, rouge/bleu, answer correctness)---
+            # --- ragas metrics (context recall/precision, rouge/bleu, answer correctness) ---
             ragas_metrics: dict[str, float] = {}
             if self._ragas_set is not None and q.answers:
                 reference = q.answers[0]
@@ -335,7 +336,7 @@ class Evaluator:
             if i % eval_log_interval_queries == 0 or now - last_log >= eval_log_interval_seconds:
                 elapsed = now - eval_start
                 avg_latency = statistics.fmean(latencies)
-                # 用配置中的首个 k(如 5)展示当前滚动 recall
+                # Show the current running recall using the first configured k (e.g. 5)
                 k0 = self._k_values[0]
                 running_recall = (
                     statistics.fmean(t[1] for t in retrieval_scores[k0])
@@ -379,7 +380,7 @@ class Evaluator:
                 "throughput_qps": len(latencies) / total if total > 0 else 0.0,
                 "total_seconds": total,
             }
-            # 分段耗时:检索段(两种模式都有)与 LLM 生成段(仅 QA 模式)。
+            # Stage-wise timings: the retrieval stage (present in both modes) and the LLM generation stage (QA mode only).
             if retrieval_latencies:
                 perf_agg.update({
                     "retrieval_mean_latency_ms": statistics.fmean(retrieval_latencies) * 1000,

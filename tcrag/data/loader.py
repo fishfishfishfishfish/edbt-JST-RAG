@@ -382,8 +382,8 @@ def load_tempevalrag(
     with open(query_path) as f:
         for line in f:
             data = json.loads(line)
-            # reference_time 在 query.jsonl 中是字符串(如年份 "2018"),
-            # 解析为 datetime;解析失败时回退到当前时间。
+            # reference_time is a string in query.jsonl (e.g. the year "2018");
+            # parse it to datetime, falling back to the current time on failure.
             reference_time = _parse_time(data.get("reference_time"))
             if reference_time is None:
                 reference_time = datetime.now(UTC)
@@ -432,14 +432,14 @@ def load_situatedqa(
     with open(path) as f:
         for line in f:
             data = json.loads(line)
-            # 获取question
+            # Get the question
             question = data.get("question", "")
             edited_question = data.get("edited_question", question)
-            # 获取id
+            # Get the id
             qid = data.get("id", hash(edited_question))
             docid = f"situatedqa_passage_{qid}"
-            # reference_time 在 query.jsonl 中是字符串(如年份 "2018"),
-            # 解析为 datetime;解析失败时回退到当前时间。
+            # reference_time is a string in query.jsonl (e.g. the year "2018");
+            # parse it to datetime, falling back to the current time on failure.
             origin_time = _parse_time(data.get("date"))
             q_time = origin_time
             doc_time = origin_time            

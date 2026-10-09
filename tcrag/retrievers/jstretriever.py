@@ -1,60 +1,62 @@
-"""MRAG 语义 + passage 级时间系数:双轴分区级联早停重排检索器。
+"""MRAG semantic + passage-level temporal coefficients: a dual-axis partitioned cascaded early-stopping reranker.
 
-在语义+时间混合重排(见
-``tcrag.retrievers.metriever_semantic_temporal``)的基础上,把昂贵的
-**全量语义重排**改造为 **T×C 双轴分区 → 对角层级遍历 → top-G 零新增
-耐心门控早停** 的级联管道,早期版本的相邻层极值分离门控设计文档见
-``docs/mrag_semantic_temporal_分阶段级联早停检索流程.md``。
+Building on semantic-temporal hybrid reranking (see
+``tcrag.retrievers.metriever_semantic_temporal``), the expensive
+**full semantic reranking** is transformed into a cascaded pipeline of
+**T×C dual-axis partitioning → diagonal-level traversal → top-G zero-increment
+patience-gated early stopping**. The design document for the earlier adjacent-level
+extremum-separation gating version can be found at
+``docs/mrag_semantic_temporal_phased-cascade-early-stopping-pipeline.md``.
 
-管道:
+Pipeline:
 
-    BM25 初始召回(默认 max(top_k*10, 1000) 候选,按 BM25 分降序)
-      → 时间问题解析(years / time_relation_type / normalized_question)
-      → 对全部候选一次性计算真实 temporal_coeff(正则+spline,CPU 毫秒级)
-      → 双轴分区:
-          T 轴:按真实 coeff 分桶 —— 最高桶 coeff≥τ_high、
-                [τ_low,τ_high) 区间均匀划分为 t_bins 个等宽桶
-                (``cascade_t_bins`` / ``MRAG_CASCADE_T_BINS``,
-                默认 1,coeff 越高桶编号越小)、兜底桶 coeff<τ_low;
-                总桶数 = t_bins+2,t_bins=1 时即固定 3 桶 T1/T2/T3
-          C 轴:按 BM25 名次等分(桶数由 ``cascade_c_bins`` /
-                ``MRAG_CASCADE_C_BINS`` 控制,默认 3 分 C1/C2/C3)
-          每个候选落入 (t_bins+2)×c_bins 网格;
-          无时间信息时网格退化为 1×c_bins
-      → 按反对角线把格子组织成层级(空层折叠):
-          默认 t_bins=1、c_bins=3 时沿用历史 6 层表:
+    BM25 initial recall (default max(top_k*10, 1000) candidates, in descending BM25 score order)
+      → Temporal question parsing (years / time_relation_type / normalized_question)
+      → Compute the true temporal_coeff for all candidates in one pass (regex+spline, CPU, millisecond-level)
+      → Dual-axis partitioning:
+          T axis: bucket by the true coeff -- the highest bucket coeff≥τ_high,
+                the [τ_low,τ_high) interval is evenly split into t_bins equal-width buckets
+                (``cascade_t_bins`` / ``CASCADE_T_BINS``,
+                default 1; the higher the coeff, the smaller the bucket index), plus a fallback bucket coeff<τ_low;
+                total number of buckets = t_bins+2; with t_bins=1 this is a fixed 3 buckets T1/T2/T3
+          C axis: evenly split by BM25 rank (number of buckets controlled by ``cascade_c_bins`` /
+                ``CASCADE_C_BINS``, default 3: C1/C2/C3)
+          Each candidate falls into the (t_bins+2)×c_bins grid;
+          the grid degenerates to 1×c_bins when there is no temporal information
+      → Organize cells into levels along anti-diagonals (empty levels are collapsed):
+          With the defaults t_bins=1 and c_bins=3 the historical 6-level table is used:
           L1=T1∩C1
           L2=T1∩C2 ∪ T2∩C1
           L3=T2∩C2
           L4=T1∩C3 ∪ T3∩C1
           L5=T2∩C3 ∪ T3∩C2
-          L6=T3∩C3(兜底层,保证被访问)
-          其余桶数组合按 s=t+c 通用反对角线分组,
-          层数 = (t_bins+2)+c_bins-1
-      → 滑动窗口逐层 hybrid 打分(rank_by_semantic + coeff 组合),
-        首批 L1∪L2 合并一次重排调用,之后每次只打新一层
-      → top-G 零新增耐心门控:维护已打分池的全局 top-G
-        (``MRAG_CASCADE_GATE_TOPK``,默认 10,与返回切片 top_k 独立);
-        新层无候选进入全局 top-G 记一次零新增,连续 M 层
-        (``MRAG_CASCADE_PATIENCE``,默认 2)零新增即提前停止
-      → 已打分池按 final 稳定降序取 top_k
+          L6=T3∩C3 (fallback level, guaranteed to be visited)
+          For other bucket combinations, generic anti-diagonal grouping s=t+c is used,
+          with (t_bins+2)+c_bins-1 levels
+      → Hybrid scoring level by level with a sliding window (rank_by_semantic + coeff combination);
+        the first batch merges L1∪L2 into a single reranking call; afterwards only each new level is scored
+      → Top-G zero-increment patience gating: maintain the global top-G of the scored pool
+        (``CASCADE_GATE_TOPK``, default 10, independent of the returned top_k slice);
+        a new level with no candidate entering the global top-G counts as one zero-increment;
+        M consecutive levels (``CASCADE_PATIENCE``, default 2) of zero-increment stop early
+      → Take the scored pool in stable descending final-score order and return the top_k
 
-关键性质:
+Key properties:
 
-- **打分公式不变**:``final = hybrid_base*semantic
-  + (1-hybrid_base)*semantic*coeff``,年份提取/筛选/兜底口径完全复用
-  标准 MRAG 叶子函数(``get_spline_function`` / ``get_temporal_coeffs``);
-- **确定性**:分区依据 coeff 真实值与 BM25 名次,门控只看 top-G 成员
-  是否变化,无随机采样;
-- **尺度无关**:门控不依赖分数绝对值/量纲(logit 平移、coeff 加权、
-  换模型均不影响判据),单层离群点由耐心 M 吸收;
-- **最坏零损失**:走到最后一层兜底时全部候选均被打分,结果与全量
-  baseline 一致;
-- **降级**:问题无时间信息时网格退化为 1×c_bins;重排模型加载失败时
-  自动回退到全量语义重排路径(等价 metriever_semantic_temporal);
-  ``MRAG_CASCADE_EARLY_STOP=false`` 也可显式关闭级联走 baseline。
+- **Scoring formula unchanged**: ``final = hybrid_base*semantic
+  + (1-hybrid_base)*semantic*coeff``; year extraction/filtering/fallback conventions fully reuse the
+  standard MRAG leaf functions (``get_spline_function`` / ``get_temporal_coeffs``);
+- **Determinism**: partitioning is based on the true coeff values and BM25 ranks; gating only watches whether the top-G membership
+  changes, with no random sampling;
+- **Scale-invariant**: gating does not depend on absolute score values/units (logit shifts, coeff weighting,
+  or switching models do not affect the criterion); single-level outliers are absorbed by patience M;
+- **Zero loss in the worst case**: when the last fallback level is reached all candidates have been scored, yielding results identical to the full
+  baseline;
+- **Degradation**: when the question has no temporal information the grid degenerates to 1×c_bins; when the reranker fails to load it
+  automatically falls back to the full semantic reranking path (equivalent to metriever_semantic_temporal);
+  ``CASCADE_EARLY_STOP=false`` also explicitly disables the cascade and runs the baseline.
 
-在 benchmark YAML 中切换:
+Switching in the benchmark YAML:
 
 .. code-block:: yaml
 
@@ -84,24 +86,28 @@ logger = get_logger(__name__)
 
 
 class JSTRetriever(MRAGRetriever):
-    """双轴分区(T coeff × C BM25 名次)级联早停版语义时间混合重排器。
+    """Semantic-temporal hybrid reranker with cascaded early stopping via dual-axis partitioning
+    (T coeff × C BM25 rank).
 
-    构造参数继承自 :class:`MRAGRetriever`,新增:
-      - ``cascade_early_stop``:级联早停总开关(关闭走全量 baseline 路径);
-      - ``cascade_t_high`` / ``cascade_t_low``:T 轴固定阈值分区边界;
-      - ``cascade_t_bins``:``[cascade_t_low, cascade_t_high)`` 区间的均匀
-        分区数(默认 1)。T 轴总桶数 = ``t_bins + 2``:最高桶
-        ``coeff ≥ t_high``、中间 ``t_bins`` 个等宽桶、兜底桶
-        ``coeff < t_low``;取 1 时退化为固定 3 桶(T1/T2/T3);
-      - ``cascade_c_bins``:C 轴(BM25 名次)分区桶数,默认 3,必须 ≥ 1;
-      - ``cascade_gate_topk``:门控前沿深度 G(默认 10):维护已打分候选的
-        全局 top-G,当某新层没有任何候选进入全局 top-G 时记一次零新增;
-      - ``cascade_patience``:耐心层数 M(默认 2):连续 M 个层对全局 top-G
-        零新增即早停。
+    Constructor parameters are inherited from :class:`MRAGRetriever`, with the following additions:
+      - ``cascade_early_stop``: master switch for cascaded early stopping (the full baseline path is used when off);
+      - ``cascade_t_high`` / ``cascade_t_low``: fixed threshold boundaries for T-axis partitioning;
+      - ``cascade_t_bins``: number of evenly sized partitions over the
+        ``[cascade_t_low, cascade_t_high)`` interval (default 1). Total T-axis
+        buckets = ``t_bins + 2``: the highest bucket ``coeff ≥ t_high``,
+        ``t_bins`` equal-width middle buckets, and the fallback bucket
+        ``coeff < t_low``; when set to 1 it degenerates to a fixed 3 buckets (T1/T2/T3);
+      - ``cascade_c_bins``: number of C-axis (BM25 rank) partition buckets, default 3, must be ≥ 1;
+      - ``cascade_gate_topk``: gating frontier depth G (default 10): maintains the global
+        top-G of scored candidates; a new level with no candidate entering the global top-G counts as one zero-increment;
+      - ``cascade_patience``: patience level count M (default 2): M consecutive levels contributing
+        zero increments to the global top-G trigger early stopping.
 
-    cross_encoder(如 ms-marco-MiniLM)输出的是可负的原始 logit。本变体
-    不做归一化、不按正负剔除候选,``_score_passages`` 对全部候选直接套
-    coeff 组合公式后入池,由 top-G 零新增门控决定何时停止后续层打分。
+    The cross_encoder (e.g. ms-marco-MiniLM) outputs raw logits that may be negative.
+    This variant performs no normalization and does not discard candidates by sign;
+    ``_score_passages`` applies the coeff combination formula directly to all candidates
+    before pooling, and the top-G zero-increment gating decides when to stop scoring
+    subsequent levels.
     """
 
     def __init__(
@@ -142,8 +148,9 @@ class JSTRetriever(MRAGRetriever):
         self._t_high = cascade_t_high
         self._t_low = cascade_t_low
         self._t_bins = cascade_t_bins
-        # [t_low, t_high) 均匀划分为 t_bins 个等宽桶;
-        # t_low == t_high 时宽度为 0,中间桶区间为空(实际无候选落入)
+        # Evenly split [t_low, t_high) into t_bins equal-width buckets;
+        # when t_low == t_high the width is 0 and the middle-bucket intervals
+        # are empty (no candidate actually falls into them)
         self._t_bin_width = (
             cascade_t_high - cascade_t_low
         ) / cascade_t_bins
@@ -152,7 +159,7 @@ class JSTRetriever(MRAGRetriever):
         self._gate_patience = cascade_patience
 
     # ───────────────────────────────────────────────────────────────────────
-    # 共享叶子:coeff 计算与 hybrid 组合
+    # Shared leaves: coeff computation and hybrid combination
     # ───────────────────────────────────────────────────────────────────────
 
     def _compute_passage_coeffs(
@@ -160,12 +167,13 @@ class JSTRetriever(MRAGRetriever):
         passages: list[Passage],
         temporal_info: TemporalInfo,
     ) -> dict[str, float] | None:
-        """对全部候选计算真实 temporal_coeff,返回 ``id → coeff`` 映射。
+        """Compute the true temporal_coeff for all candidates and return an ``id → coeff`` mapping.
 
-        与全量 baseline 的 ``_rank_passages_by_temporal`` 使用完全相同的
-        spline / 年份提取 / 合规筛选 / 0.5 兜底口径。问题无时间信息、
-        ``other`` 类型或关闭 ``hybrid_score`` 时返回 None(调用方据此
-        把网格退化为 1×3,不做时间加权)。
+        Uses exactly the same spline / year extraction / eligibility filtering /
+        0.5 fallback conventions as the full baseline's
+        ``_rank_passages_by_temporal``. Returns None when the question has no
+        temporal information, is of the ``other`` type, or ``hybrid_score`` is
+        off (the caller then degenerates the grid to 1×3 and skips temporal weighting).
         """
         years = temporal_info.years
         time_relation_type = temporal_info.time_relation_type
@@ -199,12 +207,13 @@ class JSTRetriever(MRAGRetriever):
     def _combine_final_score(
         self, semantic_score: float, coeff: float | None,
     ) -> float:
-        """hybrid 组合公式;``coeff=None``(无时间信息)时 final 即语义分。
+        """Hybrid combination formula; when ``coeff=None`` (no temporal information) final is just the semantic score.
 
-        等价写法 ``final = s * w``,其中
-        ``w = hybrid_base + (1-hybrid_base)*coeff``。调用方只传入
-        **正语义分**候选(``s > 0``,已在 ``_score_passages`` 过滤),
-        因此 coeff 越小惩罚越强,不存在负分上的反向缩放问题。
+        Equivalent form ``final = s * w``, where
+        ``w = hybrid_base + (1-hybrid_base)*coeff``. The caller only passes
+        candidates with a **positive semantic score** (``s > 0``, already
+        filtered in ``_score_passages``), so the smaller the coeff the stronger
+        the penalty, with no inverse-scaling problem on negative scores.
         """
         if coeff is None:
             return semantic_score
@@ -214,21 +223,24 @@ class JSTRetriever(MRAGRetriever):
         )
 
     # ───────────────────────────────────────────────────────────────────────
-    # 双轴分区与对角层级构造
+    # Dual-axis partitioning and diagonal level construction
     # ───────────────────────────────────────────────────────────────────────
 
     def _coeff_t_bin(self, coeff: float, t_total: int) -> int:
-        """把单个候选的真实 coeff 映射到 T 轴桶编号。
+        """Map a single candidate's true coeff to a T-axis bucket index.
 
-        - ``coeff ≥ t_high`` → 0(最高桶);
-        - ``coeff < t_low`` → ``t_total-1``(兜底桶);
-        - 其余落入 ``[t_low, t_high)`` 内 ``t_bins`` 个等宽桶之一:
-          ``t = 1 + floor((coeff-t_low)/width)``,coeff 越高编号越小,
-          浮点误差用 epsilon + clamp 吸收(编号 ∈ [1, t_bins]);
-          桶边界(如 t_low+j*width)按左闭右开口径归入 coeff 更高
-          (编号更小)的相邻桶,epsilon 仅消除二进制浮点表示误差;
-        - ``t_low == t_high`` 时中间区间为空,理论上不会走到中间分支,
-          防御性归入第 1 桶(该桶无其他候选,不影响层级结果)。
+        - ``coeff ≥ t_high`` → 0 (highest bucket);
+        - ``coeff < t_low`` → ``t_total-1`` (fallback bucket);
+        - The rest fall into one of the ``t_bins`` equal-width buckets within
+          ``[t_low, t_high)``: ``t = 1 + floor((coeff-t_low)/width)``; the
+          higher the coeff, the smaller the index, and floating-point error is
+          absorbed with epsilon + clamp (index ∈ [1, t_bins]);
+          bucket boundaries (e.g. t_low+j*width) follow the left-closed/right-open
+          convention and are assigned to the adjacent bucket with the higher
+          coeff (smaller index); epsilon only eliminates binary floating-point representation error;
+        - When ``t_low == t_high`` the middle interval is empty, so the middle
+          branch should theoretically never be reached; defensively assign to
+          bucket 1 (the bucket contains no other candidates and does not affect level results).
         """
         if coeff >= self._t_high:
             return 0
@@ -245,44 +257,50 @@ class JSTRetriever(MRAGRetriever):
         candidates: list[Passage],
         coeff_map: dict[str, float] | None,
     ) -> list[list[Passage]]:
-        """把候选按 T×C 双轴分入 ``t_total``×``c_bins`` 网格,再组织为
-        对角层级。
+        """Partition candidates by the T×C dual axes into a ``t_total``×``c_bins`` grid, then organize them into
+        diagonal levels.
 
-        - T 轴(``cascade_t_bins`` 构造参数 /
-          ``MRAG_CASCADE_T_BINS`` 环境变量,默认 1):
-          总桶数 ``t_total = t_bins + 2`` —— 最高桶 ``coeff ≥ t_high``
-          (t=0)、``[t_low, t_high)`` 区间内 ``t_bins`` 个等宽桶
-          (t=1..t_bins,coeff 越高编号越小)、兜底桶 ``coeff < t_low``
-          (t=t_total-1);``t_bins=1`` 时退化为固定 3 桶 T1/T2/T3。
-          ``coeff_map`` 为 None 时 T 轴退化为单行(网格 1×``c_bins``);
-        - C 轴:候选保持 BM25 降序,按名次等分为 ``c_bins`` 桶
-          (``cascade_c_bins`` 构造参数 / ``MRAG_CASCADE_C_BINS`` 环境变量);
-        - 层级顺序按 T/C 编号之和(反对角线)从小到大,编号和相同的格子
-          合并为一层;空层折叠剔除,仅返回非空层(每层保留 BM25 相对序)。
+        - T axis (``cascade_t_bins`` constructor parameter /
+          ``CASCADE_T_BINS`` environment variable, default 1):
+          total buckets ``t_total = t_bins + 2`` -- the highest bucket
+          ``coeff ≥ t_high`` (t=0), ``t_bins`` equal-width buckets within the
+          ``[t_low, t_high)`` interval (t=1..t_bins; the higher the coeff, the
+          smaller the index), and the fallback bucket ``coeff < t_low``
+          (t=t_total-1); with ``t_bins=1`` it degenerates to a fixed 3 buckets T1/T2/T3.
+          When ``coeff_map`` is None the T axis degenerates to a single row (a 1×``c_bins`` grid);
+        - C axis: candidates remain in descending BM25 order and are evenly
+          split into ``c_bins`` buckets by rank (``cascade_c_bins`` constructor
+          parameter / ``CASCADE_C_BINS`` environment variable);
+        - Levels are ordered by the sum of the T/C indices (anti-diagonal) from
+          small to large; cells with the same index sum are merged into one
+          level; empty levels are collapsed and discarded, returning only
+          non-empty levels (the relative BM25 order is preserved within each level).
 
-        特例:``t_bins == 1 且 c_bins == 3``(默认 3×3)时沿用历史
-        6 层表(把反对角线和为 2 的中心格 (1,1) 提前于两角格
-        (0,2)/(2,0) 单独成层),保证与既有实验结果完全可比;
-        其余桶数走通用反对角线分组(层数 = t_total+c_bins-1)。
+        Special case: ``t_bins == 1 and c_bins == 3`` (the default 3×3) retains
+        the historical 6-level table (the central cell (1,1), whose anti-diagonal
+        sum is 2, forms its own level before the two corner cells
+        (0,2)/(2,0)), ensuring full comparability with existing experimental results;
+        other bucket counts use generic anti-diagonal grouping (number of levels = t_total+c_bins-1).
         """
         temporal_on = coeff_map is not None
         n = len(candidates)
         c_bins = self._c_bins
         t_total = self._t_bins + 2 if temporal_on else 1
 
-        # C 轴等分边界:第 k 桶右边界(不含)为 ceil((k+1)*n/c_bins)
+        # C-axis equal-split boundaries: the exclusive right boundary of the
+        # k-th bucket is ceil((k+1)*n/c_bins)
         c_ends = [
             ((k + 1) * n + c_bins - 1) // c_bins
             for k in range(c_bins - 1)
         ]
 
-        # grid[t][c],t ∈ {0,..,t_total-1},c ∈ {0,..,c_bins-1}
+        # grid[t][c], t ∈ {0,..,t_total-1}, c ∈ {0,..,c_bins-1}
         grid: list[list[list[Passage]]] = [
             [[] for _ in range(c_bins)] for _ in range(t_total)
         ]
 
         for idx, ctx in enumerate(candidates):
-            # bisect_right:idx 落在第几个右边界之后,即所属桶编号
+            # bisect_right: after how many right boundaries idx falls, i.e. its bucket index
             c_idx = bisect.bisect_right(c_ends, idx)
             if temporal_on:
                 t_idx = self._coeff_t_bin(coeff_map[ctx.id], t_total)
@@ -291,17 +309,18 @@ class JSTRetriever(MRAGRetriever):
             grid[t_idx][c_idx].append(ctx)
 
         if temporal_on and self._t_bins == 1 and c_bins == 3:
-            # 历史 6 层表(3×3 专用):中心格 (1,1) 早于同对角线两角格
+            # Historical 6-level table (3×3 specific): the central cell (1,1)
+            # precedes the two corner cells on the same anti-diagonal
             layer_cells: list[list[tuple[int, int]]] = [
                 [(0, 0)],                                 # L1: T1∩C1
                 [(0, 1), (1, 0)],                         # L2
                 [(1, 1)],                                 # L3
                 [(0, 2), (2, 0)],                         # L4
                 [(1, 2), (2, 1)],                         # L5
-                [(2, 2)],                                 # L6: T3∩C3 兜底
+                [(2, 2)],                                 # L6: T3∩C3 fallback
             ]
         elif temporal_on:
-            # 通用反对角线分组:s = t + c 相同的格子为一层
+            # Generic anti-diagonal grouping: cells with the same s = t + c form one level
             layer_cells = []
             for s in range(t_total + c_bins - 1):
                 cells = [
@@ -323,7 +342,7 @@ class JSTRetriever(MRAGRetriever):
         return layers
 
     # ───────────────────────────────────────────────────────────────────────
-    # 层内打分
+    # Intra-level scoring
     # ───────────────────────────────────────────────────────────────────────
 
     def _score_passages(
@@ -332,16 +351,18 @@ class JSTRetriever(MRAGRetriever):
         normalized_question: str,
         coeff_map: dict[str, float] | None,
     ) -> list[Passage]:
-        """对一组候选发起一次 ``rank_by_semantic`` 调用(组内合并 batch)。
+        """Issue one ``rank_by_semantic`` call for a group of candidates (batched together within the group).
 
-        流程:
-          1. 重排模型打分(原始语义分写回 ``ctx.score``);
-          2. 全部候选保留入池,套 hybrid 组合公式(``coeff_map=None``
-             时 final 即语义分),不按分数正负剔除;
-          3. 按 final 降序返回。
+        Flow:
+          1. The reranker scores them (the raw semantic score is written back to ``ctx.score``);
+          2. All candidates are retained in the pool and the hybrid combination
+             formula is applied (when ``coeff_map=None`` final is just the
+             semantic score), without discarding any by score sign;
+          3. Return in descending final-score order.
 
-        返回候选数与入参一致;是否继续打后续层由 top-G 零新增门控决定,
-        与本函数无关。
+        The number of returned candidates matches the input; whether subsequent
+        levels continue to be scored is decided by the top-G zero-increment gate
+        and is unrelated to this function.
         """
         scored = self.rank_by_semantic(
             passages, normalized_question, normalized=True,
@@ -362,9 +383,10 @@ class JSTRetriever(MRAGRetriever):
         pool: list[Passage],
         gate_k: int,
     ) -> list[tuple[str, float]]:
-        """该时刻已打分池的全局 top-``gate_k`` 快照 ``[(id, score), ...]``。
+        """Snapshot of the global top-``gate_k`` of the scored pool at this moment: ``[(id, score), ...]``.
 
-        池内候选不足 ``gate_k`` 时返回池内全部候选(降序);空池返回 []。
+        Returns all candidates in the pool (in descending order) when the pool
+        contains fewer than ``gate_k`` candidates; returns [] for an empty pool.
         """
         ranked = sorted(pool, key=lambda x: x.score, reverse=True)
         cutoff = gate_k if len(pool) >= gate_k else len(pool)
@@ -377,12 +399,15 @@ class JSTRetriever(MRAGRetriever):
         kept: list[Passage],
         gate_k: int,
     ) -> tuple[int, list[tuple[str, float]]]:
-        """统计 ``kept``(新打分一层)有多少候选进入全池全局 top-``gate_k``。
+        """Count how many candidates of ``kept`` (a newly scored level) enter the global pool-wide top-``gate_k``.
 
-        返回 ``(new_in_count, top_g_snapshot)``;池内候选不足 ``gate_k``
-        时前沿取池内全部候选(新层任何候选都算新入,等价于数量门控自动
-        放宽,避免小池被误判为零新增)。``kept`` 为空(空层)时新入数为 0,
-        但仍返回当前 top-G 快照(与上一层相同,用于日志追踪前沿)。
+        Returns ``(new_in_count, top_g_snapshot)``; when the pool contains fewer
+        than ``gate_k`` candidates the frontier takes all pool candidates (any
+        candidate of the new level counts as newly entered, equivalent to an
+        automatically relaxed count gate, avoiding a small pool being misjudged
+        as zero-increment). When ``kept`` is empty (an empty level) the new-entry
+        count is 0, but the current top-G snapshot is still returned (identical
+        to the previous level, used for logging frontier tracking).
         """
         if not pool:
             return 0, []
@@ -395,11 +420,12 @@ class JSTRetriever(MRAGRetriever):
     def _layer_score_quantiles(
         passages: list[Passage],
     ) -> tuple[float, float, float, float, float]:
-        """层内 final 分的 (min, p5, p50, p95, max)。
+        """(min, p5, p50, p95, max) of the intra-level final scores.
 
-        采用最近秩(nearest-rank)口径:升序排序后 p 分位取
-        ``sorted[ceil(p*n)-1]``;纯 Python 实现,单层样本量 ≤ N,开销可忽略。
-        n=1 时五个统计量相同。
+        Uses the nearest-rank convention: after ascending sorting, the p-th
+        percentile is ``sorted[ceil(p*n)-1]``; a pure-Python implementation
+        with at most N samples per level, so the cost is negligible.
+        All five statistics are identical when n=1.
         """
         scores = sorted(ctx.score for ctx in passages)
         n = len(scores)
@@ -411,7 +437,7 @@ class JSTRetriever(MRAGRetriever):
         return scores[0], rank(0.05), rank(0.50), rank(0.95), scores[-1]
 
     # ───────────────────────────────────────────────────────────────────────
-    # baseline 全量路径(级联关闭 / 模型不可用 / 兜底对照)
+    # Full baseline path (cascade off / model unavailable / fallback control)
     # ───────────────────────────────────────────────────────────────────────
 
     def _retrieve_full(
@@ -421,10 +447,11 @@ class JSTRetriever(MRAGRetriever):
         temporal_info: TemporalInfo,
         top_k: int,
     ) -> list[Passage]:
-        """全量 baseline:全部候选一次语义重排 → 全部保留 → 时间加权。
+        """Full baseline: semantic reranking of all candidates at once → all retained → temporal weighting.
 
-        与级联路径使用同一个 ``_score_passages``(全量保留 + hybrid
-        组合 + 降序),保证两种路径打分口径完全一致。
+        Uses the same ``_score_passages`` as the cascade path (retain all +
+        hybrid combination + descending order), ensuring the scoring conventions
+        of the two paths are identical.
         """
         coeff_map = self._compute_passage_coeffs(initial_candidates, temporal_info)
         ranked = self._score_passages(
@@ -433,7 +460,7 @@ class JSTRetriever(MRAGRetriever):
         return ranked[:top_k]
 
     # ───────────────────────────────────────────────────────────────────────
-    # 级联早停主管道
+    # Cascaded early-stopping main pipeline
     # ───────────────────────────────────────────────────────────────────────
 
     def _retrieve_cascade(
@@ -443,22 +470,26 @@ class JSTRetriever(MRAGRetriever):
         temporal_info: TemporalInfo,
         top_k: int,
     ) -> list[Passage]:
-        """T×C 双轴分区 → 对角层级滑动窗口 → top-G 零新增耐心门控 → top_k。
+        """T×C dual-axis partitioning → diagonal-level sliding window → top-G zero-increment patience gating → top_k.
 
-        门控(方案 A):维护已打分候选的全局 top-G(``cascade_gate_topk``),
-        每打完一层统计该层进入全局 top-G 的候选数 ``new_in``;``new_in=0``
-        时零新增计数 +1,否则清零;连续 M 层(``cascade_patience``)零新增
-        即早停。L1 用于建立初始前沿,不参与零新增计数。
+        Gating (scheme A): maintain the global top-G (``cascade_gate_topk``) of
+        scored candidates; after each level is scored, count ``new_in``, the
+        number of candidates from that level entering the global top-G; when
+        ``new_in=0`` the zero-increment count is increased by 1, otherwise
+        reset; M consecutive levels (``cascade_patience``) of zero-increment
+        trigger early stopping. L1 establishes the initial frontier and does not
+        participate in the zero-increment count.
 
-        判据只依赖「top-G 成员是否变化」,与分数尺度(logit 平移/coeff
-        加权)无关,且对单层离群点由耐心层数 M 吸收;门控深度 G 与最终
-        返回切片数 ``top_k`` 相互独立。
+        The criterion depends only on "whether the top-G membership changes" and
+        is independent of score scale (logit shifts / coeff weighting); single-level
+        outliers are absorbed by the patience level count M; the gating depth G is
+        independent of the final returned slice count ``top_k``.
         """
         total = len(initial_candidates)
         gate_k = self._gate_topk
         patience = self._gate_patience
 
-        # 全量 coeff 前置(纯 CPU,供 T 分区与层内打分共用)
+        # Full coeff computation upfront (pure CPU; shared by T partitioning and intra-level scoring)
         coeff_map = self._compute_passage_coeffs(
             initial_candidates, temporal_info,
         )
@@ -467,12 +498,12 @@ class JSTRetriever(MRAGRetriever):
         layer_sizes = [len(layer) for layer in layers]
 
         pool: list[Passage] = []
-        # 已访问层 → hybrid 后的候选(空列表表示该层打分后为空)
+        # Visited levels → candidates after hybrid (an empty list means the level is empty after scoring)
         kept_by_layer: dict[int, list[Passage]] = {}
-        # 每层进入全局 top-G 的候选数 / 该层打完后的连续零新增 streak
+        # Per-level count of candidates entering the global top-G / consecutive zero-increment streak after that level is scored
         new_in_by_layer: dict[int, int] = {}
         streak_by_layer: dict[int, int] = {}
-        # 每层打完后全局 top-G 前沿快照 [(id, final_score), ...](降序)
+        # Global top-G frontier snapshot after each level is scored [(id, final_score), ...] (descending)
         topg_by_layer: dict[int, list[tuple[str, float]]] = {}
 
         def score_layer(idx: int) -> list[Passage]:
@@ -489,11 +520,13 @@ class JSTRetriever(MRAGRetriever):
             establish: bool = False,
             snapshot_pool: list[Passage] | None = None,
         ) -> tuple[int, int]:
-            """合并一层后计算 top-G 新入数并更新连续零新增 streak。
+            """Compute the top-G new-entry count after merging one level and update the consecutive zero-increment streak.
 
-            ``snapshot_pool`` 用于首批 L1∪L2 共用一次打分的情形:记录
-            L1 行时只让 L1 候选进入快照,语义上等价于「打完 L1 后」;
-            门控状态(streak)仍以真实全池为准,establish 层不参与门控。
+            ``snapshot_pool`` is used for the case where the first batch
+            L1∪L2 shares one scoring call: when recording the L1 row, only L1
+            candidates are allowed into the snapshot, which is semantically
+            equivalent to "after L1 is scored"; the gating state (streak) still
+            follows the real full pool, and the establish layer does not participate in gating.
             """
             kept = kept_by_layer[idx]
             view_pool = snapshot_pool if snapshot_pool is not None else pool
@@ -503,7 +536,7 @@ class JSTRetriever(MRAGRetriever):
             new_in_by_layer[idx] = new_in
             topg_by_layer[idx] = snapshot
             if establish:
-                # L1 建立前沿,streak 固定为 0,不参与门控
+                # L1 establishes the frontier; the streak is fixed at 0 and does not participate in gating
                 streak = 0
             else:
                 prev = streak_by_layer.get(idx - 1, 0)
@@ -511,7 +544,7 @@ class JSTRetriever(MRAGRetriever):
             streak_by_layer[idx] = streak
             return new_in, streak
 
-        # 退化情形:折叠后只有一个非空层,打完即返回
+        # Degenerate case: only one non-empty level after collapsing; return once it is scored
         if len(layers) == 1:
             score_layer(0)
             account(0, establish=True)
@@ -526,7 +559,7 @@ class JSTRetriever(MRAGRetriever):
             pool.sort(key=lambda x: x.score, reverse=True)
             return pool[:top_k]
 
-        # 首批:L1∪L2 合并为一次重排调用(保 batch 利用率),再按层身份拆开
+        # First batch: merge L1∪L2 into one reranking call (to preserve batch utilization), then split back by level identity
         first_ids = {ctx.id for ctx in layers[0]}
         first_scored = self._score_passages(
             layers[0] + layers[1], normalized_question, coeff_map,
@@ -538,12 +571,13 @@ class JSTRetriever(MRAGRetriever):
         pool.extend(first_scored)
         model_scored = layer_sizes[0] + layer_sizes[1]
 
-        # L1 建立前沿(快照只含 L1,语义上是「打完 L1 后」的 top-G);
-        # L2 起按真实全池累计耐心
+        # L1 establishes the frontier (the snapshot contains only L1, semantically
+        # the top-G "after L1 is scored"); from L2 on, patience accumulates
+        # against the real full pool
         account(0, establish=True, snapshot_pool=front)
         _, streak = account(1)
 
-        stopped_layer = -1  # -1 表示走到最后一层兜底
+        stopped_layer = -1  # -1 means the last fallback level was reached
         if streak >= patience:
             stopped_layer = 1
         else:
@@ -567,7 +601,7 @@ class JSTRetriever(MRAGRetriever):
             temporal_on=coeff_map is not None,
         )
 
-        # 已打分池稳定降序(同分保持打分批次内顺序),取 top_k
+        # Sort the scored pool in stable descending order (ties keep the within-batch order) and take top_k
         pool.sort(key=lambda x: x.score, reverse=True)
         return pool[:top_k]
 
@@ -601,11 +635,13 @@ class JSTRetriever(MRAGRetriever):
             if temporal_on
             else "off(1x%d)" % self._c_bins,
         )
-        # 每层两行:
-        #   ① final 分分位数 + 门控信号(进入全局 top-G 的新入数 new_in、
-        #      连续零新增 streak;streak >= patience 即门控命中点);
-        #   ② 打完该层后全局 top-G 前沿快照(id=final 分,降序),
-        #      直观看前沿成员何时停止变化。
+        # Two lines per level:
+        #   ① final-score quantiles + gating signals (new_in, the new-entry
+        #      count into the global top-G, and streak, the consecutive
+        #      zero-increment count; streak >= patience is the gate-hit point);
+        #   ② global top-G frontier snapshot after that level is scored
+        #      (id=final score, descending), making it easy to see when the
+        #      frontier members stop changing.
         for idx, size in enumerate(layer_sizes):
             tag = f"L{idx + 1}"
             if idx not in kept_by_layer:
@@ -636,7 +672,7 @@ class JSTRetriever(MRAGRetriever):
                 )
 
     # ───────────────────────────────────────────────────────────────────────
-    # 对外入口
+    # Public entry point
     # ───────────────────────────────────────────────────────────────────────
 
     async def retrieve(
@@ -647,29 +683,31 @@ class JSTRetriever(MRAGRetriever):
         candidates: list[Passage] | None = None,
         top_k: int = 10,
     ) -> list[Passage]:
-        """双轴分区级联早停检索管道(独立模式)。
+        """Dual-axis partitioned cascaded early-stopping retrieval pipeline (standalone mode).
 
         Steps:
-            0. 初始 BM25 召回(复用父类,候选按 BM25 分降序)
-            1. 时间信息预处理,取 normalized_question
-            2. 全量计算真实 temporal_coeff
-            3. T(coeff 阈值)×C(BM25 名次)双轴分区,构造对角层级
-            4. 滑动窗口逐层 hybrid 打分,top-G 零新增耐心门控早停
-            5. 已打分池按最终分降序取 top_k
+            0. Initial BM25 recall (reusing the parent class; candidates in descending BM25 score order)
+            1. Preprocess temporal information and take normalized_question
+            2. Compute the true temporal_coeff for all candidates
+            3. Dual-axis partitioning by T (coeff threshold) × C (BM25 rank), constructing diagonal levels
+            4. Sliding-window level-by-level hybrid scoring with top-G zero-increment patience-gated early stopping
+            5. Sort the scored pool by final score in descending order and take top_k
 
-        级联关闭或重排模型不可用时,回退全量 baseline 路径。
+        Falls back to the full baseline path when the cascade is off or the
+        reranker is unavailable.
         """
-        # Step 0: 初始检索
+        # Step 0: initial retrieval
         initial_candidates = await self._initial_retrieval(query, candidates)
         if not initial_candidates:
             return []
 
-        # Step 1: 时间归一化(与标准 MRAG Step4 同口径)
+        # Step 1: temporal normalization (same convention as standard MRAG Step 4)
         temporal_info = self.parse_temporal_question(query, time_relation)
         normalized_question = temporal_info.normalized_question or query
 
-        # 模型不可用时级联没有节省对象,直接走全量路径(模型失败时
-        # rank_by_semantic 内部原样返回 BM25 序,行为与 baseline 一致)
+        # When the model is unavailable there is nothing for the cascade to
+        # save, so go directly through the full path (on model failure
+        # rank_by_semantic returns the BM25 order as-is internally, behaving consistently with the baseline)
         use_cascade = self._cascade_enabled and self._load_reranker() is not None
         if not use_cascade:
             return self._retrieve_full(
@@ -690,9 +728,10 @@ class JSTRetriever(MRAGRetriever):
         fusion: str = "rrf",
         filters: dict[str, Any] | None = None,
     ) -> list[Any]:
-        """NuggetIndex 集成接口,签名与父类一致,调度到级联早停管道。
+        """NuggetIndex integration interface; the signature matches the parent class and it dispatches to the cascaded early-stopping pipeline.
 
-        初始召回候选数与标准版一致(``max(top_k*10, 1000)``)。
+        The initial recall candidate count matches the standard version
+        (``max(top_k*10, 1000)``).
         """
         candidates = await self._initial_retrieval(
             query, top_k=max(top_k * 10, 1000))
@@ -715,57 +754,64 @@ def _env_flag(name: str, default: bool) -> bool:
 def create_jst_retriever(
     store: Any, *, llm: Any | None = None,
 ) -> JSTRetriever:
-    """NuggetIndex 集成工厂函数(双轴分区级联早停版)。
+    """NuggetIndex integration factory function (dual-axis partitioned cascaded early-stopping version).
 
-    签名与 :func:`tcrag.retrievers.metriever.create_mrag_retriever`
-    兼容,可直接替换 benchmark YAML 中的 ``retriever_factory``。
+    The signature is compatible with
+    :func:`tcrag.retrievers.metriever.create_mrag_retriever` and can directly
+    replace the ``retriever_factory`` in the benchmark YAML.
 
     Args:
-        store: NuggetStore 实例(nuggetindex 集成模式)。
-        llm: 仅为与 benchmark 的 partial(llm=...) 调用约定兼容而保留;
-            本管道无 LLM 环节,传入的实例不会被使用。
+        store: NuggetStore instance (nuggetindex integration mode).
+        llm: Retained only for compatibility with the benchmark's
+            partial(llm=...) calling convention; this pipeline has no LLM stage
+            and any passed-in instance will not be used.
 
-    生效的环境变量:
-      - ``MRAG_BM25_INDEX_PATH``:Pyserini Lucene 索引路径
-        (不设则用 store 后端 BM25);
-      - ``MRAG_RERANKER_MODEL``:语义重排模型 HF 名称
-        (默认 ``nvidia/NV-Embed-v2``);
-      - ``MRAG_RERANKER_TYPE``:cross_encoder | bge | nv_embed | sfr | jina
-        (默认 ``nv_embed``);
-      - ``MRAG_HYBRID_BASE``:混合公式中语义分数的最低保留比例(默认 0.0);
-      - ``MRAG_SNT_WITH_TITLE``:提取 passage 年份时是否附加标题(默认 true);
-      - ``MRAG_CASCADE_EARLY_STOP``:级联早停总开关(默认 true;
-        设为 false 时本变体等价于全量 semantic_temporal baseline);
-      - ``MRAG_CASCADE_T_HIGH`` / ``MRAG_CASCADE_T_LOW``:
-        T 轴固定阈值(默认 0.9 / 0.6);
-      - ``MRAG_CASCADE_T_BINS``:``[t_low, t_high)`` 区间的均匀分区数
-        (默认 1)。T 轴总桶数 = t_bins+2(最高桶 + t_bins 个等宽桶 +
-        兜底桶),取 1 时退化为固定 3 桶 T1/T2/T3;仅在
-        ``t_bins=1 且 c_bins=3`` 时沿用历史 6 层对角表,其他组合按
-        反对角线自动分组,层数为 (t_bins+2)+c_bins-1;
-      - ``MRAG_CASCADE_C_BINS``:C 轴(BM25 名次)分区桶数(默认 3;
-        取 3 且 t_bins=1 时沿用历史 6 层对角表,其他值按反对角线
-        自动分组,层数为 (t_bins+2)+c_bins-1);
-      - ``MRAG_CASCADE_GATE_TOPK``:门控前沿深度 G(默认 10),与最终
-        返回切片数 top_k 独立(后者经 nuggetindex 聚合冗余放大为
-        top_k*3,不应用作门控深度);
-      - ``MRAG_CASCADE_PATIENCE``:耐心层数 M(默认 2),连续 M 层无
-        候选进入全局 top-G 即早停。
+    Effective environment variables:
+      - ``BM25_INDEX_PATH``: Path to the Pyserini Lucene index
+        (the store backend BM25 is used when unset);
+      - ``RERANKER_MODEL``: HF name of the semantic reranking model
+        (default ``nvidia/NV-Embed-v2``);
+      - ``RERANKER_TYPE``: cross_encoder | bge | nv_embed | sfr | jina
+        (default ``nv_embed``);
+      - ``HYBRID_BASE``: Minimum retained fraction of the semantic score in the hybrid formula (default 0.0);
+      - ``SNT_WITH_TITLE``: Whether to attach the title when extracting passage years (default true);
+      - ``CASCADE_EARLY_STOP``: Master switch for cascaded early stopping (default true;
+        when false this variant is equivalent to the full semantic_temporal baseline);
+      - ``CASCADE_T_HIGH`` / ``CASCADE_T_LOW``:
+        Fixed T-axis thresholds (default 0.9 / 0.6);
+      - ``CASCADE_T_BINS``: Number of evenly sized partitions over the
+        ``[t_low, t_high)`` interval (default 1). Total T-axis buckets =
+        t_bins+2 (highest bucket + t_bins equal-width buckets + fallback bucket);
+        when 1 it degenerates to a fixed 3 buckets T1/T2/T3; the historical
+        6-level diagonal table is retained only when ``t_bins=1 and c_bins=3``;
+        other combinations are automatically grouped along anti-diagonals, with
+        (t_bins+2)+c_bins-1 levels;
+      - ``CASCADE_C_BINS``: Number of C-axis (BM25 rank) partition buckets (default 3;
+        when 3 and t_bins=1 the historical 6-level diagonal table is retained;
+        other values are automatically grouped along anti-diagonals, with
+        (t_bins+2)+c_bins-1 levels);
+      - ``CASCADE_GATE_TOPK``: Gating frontier depth G (default 10), independent
+        of the final returned slice count top_k (the latter is amplified with
+        redundancy to top_k*3 during nuggetindex aggregation and must not be
+        used as the gating depth);
+      - ``CASCADE_PATIENCE``: Patience level count M (default 2); early stopping
+        triggers when M consecutive levels have no candidate entering the global top-G.
 
-    语义分处理:重排后全部候选保留入池并按 coeff 组合(不做归一化)。
+    Semantic score handling: after reranking all candidates are retained in the
+    pool and combined by coeff (no normalization is performed).
     """
-    bm25_index = os.getenv("MRAG_BM25_INDEX_PATH")
-    reranker_model = os.getenv("MRAG_RERANKER_MODEL", "nvidia/NV-Embed-v2")
-    reranker_type = os.getenv("MRAG_RERANKER_TYPE", "nv_embed")
-    hybrid_base = float(os.getenv("MRAG_HYBRID_BASE", "0.0"))
-    snt_with_title = _env_flag("MRAG_SNT_WITH_TITLE", True)
-    cascade_enabled = _env_flag("MRAG_CASCADE_EARLY_STOP", True)
-    cascade_t_high = float(os.getenv("MRAG_CASCADE_T_HIGH", "0.9"))
-    cascade_t_low = float(os.getenv("MRAG_CASCADE_T_LOW", "0.6"))
-    cascade_t_bins = int(os.getenv("MRAG_CASCADE_T_BINS", "1"))
-    cascade_c_bins = int(os.getenv("MRAG_CASCADE_C_BINS", "3"))
-    cascade_gate_topk = int(os.getenv("MRAG_CASCADE_GATE_TOPK", "10"))
-    cascade_patience = int(os.getenv("MRAG_CASCADE_PATIENCE", "2"))
+    bm25_index = os.getenv("BM25_INDEX_PATH")
+    reranker_model = os.getenv("RERANKER_MODEL", "nvidia/NV-Embed-v2")
+    reranker_type = os.getenv("RERANKER_TYPE", "nv_embed")
+    hybrid_base = float(os.getenv("HYBRID_BASE", "0.0"))
+    snt_with_title = _env_flag("SNT_WITH_TITLE", True)
+    cascade_enabled = _env_flag("CASCADE_EARLY_STOP", True)
+    cascade_t_high = float(os.getenv("CASCADE_T_HIGH", "0.9"))
+    cascade_t_low = float(os.getenv("CASCADE_T_LOW", "0.6"))
+    cascade_t_bins = int(os.getenv("CASCADE_T_BINS", "1"))
+    cascade_c_bins = int(os.getenv("CASCADE_C_BINS", "3"))
+    cascade_gate_topk = int(os.getenv("CASCADE_GATE_TOPK", "10"))
+    cascade_patience = int(os.getenv("CASCADE_PATIENCE", "2"))
 
     logger.info(
         "Creating JSTRetriever (T coeff × C BM25 dual-axis partition "

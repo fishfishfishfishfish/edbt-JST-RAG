@@ -74,9 +74,11 @@ class QAPipeline:
         ctx_top_k: int | None = None,
         context_token_budget: int = 3000,
     ) -> None:
-        """``top_k`` 为检索深度(rag top_k,返回给评估的 hits 数);
-        ``ctx_top_k`` 为实际用于构造 LLM 上下文的段落数,为 None 时等于 top_k。
-        检索指标(QAResult.retrieved)始终基于全量 top_k hits 计算。
+        """``top_k`` is the retrieval depth (rag top_k, the number of hits
+        returned for evaluation); ``ctx_top_k`` is the number of passages
+        actually used to build the LLM context, and equals top_k when None.
+        Retrieval metrics (QAResult.retrieved) are always computed over the
+        full set of top_k hits.
         """
         self._rag = rag_system
         self._llm = llm
@@ -93,7 +95,8 @@ class QAPipeline:
             reference_time=query.reference_time,
         )
         retrieval_latency = time.perf_counter() - t_ret
-        # ctx top_k:仅取检索结果前 N 条构造上下文;检索指标仍用全量 hits
+        # ctx top_k: only the first N retrieval hits build the context;
+        # retrieval metrics still use the full set of hits
         ctx = self._ctx.build(hits[: self._ctx_top_k])
         prompt = (
             f"Context:\n{ctx.text}\n\n"

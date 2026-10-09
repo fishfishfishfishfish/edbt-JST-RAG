@@ -16,10 +16,12 @@ _configured = False
 def get_logger(name: str | None = None) -> logging.Logger:
     """Return a child logger of the TCRag root logger.
 
-    传入的 ``name`` 若已带 ``tcrag.`` 前缀(如 ``__name__`` 在以包形式
-    导入时为 ``tcrag.retrievers.xxx``)会先归一化去掉,避免拼出
-    ``tcrag.tcrag.retrievers.xxx`` 这种双前缀 logger,导致按
-    ``tcrag.retrievers.xxx`` 调 setLevel / 过滤时匹配不到真实 logger。
+    If the given ``name`` already carries the ``tcrag.`` prefix (e.g.
+    ``__name__`` is ``tcrag.retrievers.xxx`` when imported as a package), it
+    is first normalized by stripping the prefix, avoiding a double-prefixed
+    logger such as ``tcrag.tcrag.retrievers.xxx``, which would not match the
+    real logger when calling setLevel / applying filters under
+    ``tcrag.retrievers.xxx``.
     """
     root = logging.getLogger(_LOGGER_NAME)
     if name:
@@ -70,12 +72,14 @@ def setup_logging(
 def configure_from_dict(cfg: dict[str, Any]) -> logging.Logger:
     """Apply logging config from the ``logging`` section of the YAML config.
 
-    支持两个环境变量临时覆盖,均无需改配置文件:
-      - ``TCRAG_LOG_LEVEL``:整体级别(如 ``DEBUG``),优先级高于 YAML 的
-        ``logging.level``;
-      - ``TCRAG_DEBUG_LOGGERS``:逗号分隔的模块名,仅把这些 logger 提到
-        DEBUG,其他模块保持原级别。模块名写全名或省略 ``tcrag.`` 前缀
-        均可,例如 ``TCRAG_DEBUG_LOGGERS=retrievers.jstretriever``。
+    Two environment variables are supported for temporary overrides, neither
+    requiring a config-file change:
+      - ``TCRAG_LOG_LEVEL``: global level (e.g. ``DEBUG``), taking precedence
+        over the YAML ``logging.level``;
+      - ``TCRAG_DEBUG_LOGGERS``: comma-separated module names; only these
+        loggers are raised to DEBUG while other modules keep their original
+        level. Module names may be given in full or without the ``tcrag.``
+        prefix, e.g. ``TCRAG_DEBUG_LOGGERS=retrievers.jstretriever``.
     """
     level = os.getenv("TCRAG_LOG_LEVEL", cfg.get("level", "INFO"))
     root = setup_logging(

@@ -87,7 +87,7 @@ fi
 # Semantic reranker note: when there is no local cache and huggingface.co is
 # unreachable, the runtime downgrades to BM25 ranking after the model fails to
 # load (the cascade then falls back to the full path); warn here in advance.
-RERANKER="${MRAG_RERANKER_MODEL:-nvidia/NV-Embed-v2}"
+RERANKER="${RERANKER_MODEL:-nvidia/NV-Embed-v2}"
 case "$RERANKER" in
     /*) : ;;  # local path, skip cache check
     *)

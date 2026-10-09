@@ -48,9 +48,9 @@ def f1_at_k(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float:
 # Answer-quality metrics
 # ---------------------------------------------------------------------------
 
-# \w 等价于 [a-zA-Z0-9_](字母、数字、下划线)
-# 开启 Unicode 模式后,\w 的语义扩展为 [a-zA-Z0-9_] + 所有 Unicode 字母/数字(包括中文、日文、西里尔字母等)。
-# 标点/空格作为天然分隔符:被 \w+ 自然跳过,不需要显式分词
+# \w is equivalent to [a-zA-Z0-9_] (letters, digits, underscore)
+# With Unicode mode enabled, the meaning of \w expands to [a-zA-Z0-9_] plus all Unicode letters/digits (including Chinese, Japanese, Cyrillic, etc.).
+# Punctuation and whitespace serve as natural separators and are skipped by \w+ automatically, so no explicit tokenization is needed.
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 

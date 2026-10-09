@@ -101,14 +101,14 @@ referring to its Hugging Face id `cross-encoder/ms-marco-MiniLM-L6-v2`.
 Then point the retriever at it through environment variables:
 
 ```bash
-export MRAG_RERANKER_TYPE=cross_encoder
-export MRAG_RERANKER_MODEL=$PWD/models/ms-marco-MiniLM-L6-v2
+export RERANKER_TYPE=cross_encoder
+export RERANKER_MODEL=$PWD/models/ms-marco-MiniLM-L6-v2
 # ...or, without a local clone:
-# export MRAG_RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L6-v2
+# export RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L6-v2
 ```
 
 If these variables are unset, the pipeline defaults to
-`nvidia/NV-Embed-v2` (`MRAG_RERANKER_TYPE=nv_embed`).
+`nvidia/NV-Embed-v2` (`RERANKER_TYPE=nv_embed`).
 
 ### 4. Prepare the Python environment and install dependencies
 
